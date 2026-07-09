@@ -61,7 +61,7 @@ class Dashboard(QMainWindow):
         self.cfg = cfg
         self.state = state
 
-        self.setWindowTitle("Maze Network")
+        self.setWindowTitle("Maze Guard")
         self.setWindowIcon(create_app_icon(64))
         self.setMinimumSize(1100, 720)
         self.resize(1280, 820)
@@ -72,6 +72,7 @@ class Dashboard(QMainWindow):
         self._setup_tray()
         self._setup_timer()
         self._connect_bus()
+        self._setup_auto_profile()
 
         state.language_changed.connect(self.retranslate)
         state.theme_changed.connect(self._on_theme_changed)
@@ -97,7 +98,7 @@ class Dashboard(QMainWindow):
         layout.setContentsMargins(16, 0, 0, 0)
         layout.setSpacing(12)
 
-        logo = QLabel("MAZE NETWORK")
+        logo = QLabel("MAZE GUARD")
         logo.setObjectName("logo")
         layout.addWidget(logo)
 
@@ -192,7 +193,10 @@ class Dashboard(QMainWindow):
         self.firewall_view = FirewallView(self.state, self.engine)
 
         from maze.gui.widgets.settings_view import SettingsView
-        self.settings_view = SettingsView(self.state, self.engine, self.cfg, self._save_config)
+        self.settings_view = SettingsView(
+            self.state, self.engine, self.cfg, self._save_config,
+            on_auto_profile_change=self.refresh_auto_profile,
+        )
 
         self.tabs.addTab(self.dash_view,     self.state.t("tab_dashboard"))
         self.tabs.addTab(self.event_list,    self.state.t("tab_events"))
@@ -225,6 +229,35 @@ class Dashboard(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    # ── Auto profile switching ───────────────────────────────────────────
+
+    def _setup_auto_profile(self) -> None:
+        from maze.network.auto_profile import AutoProfileWatcher
+        self._auto_watcher = AutoProfileWatcher(
+            self.cfg.interface,
+            self.cfg.trusted_networks,
+            self._on_auto_profile,
+        )
+        self.refresh_auto_profile()
+
+    def refresh_auto_profile(self) -> None:
+        """(Re)configure the auto-profile watcher from current config.
+        Called at startup and whenever Settings changes the toggle or the
+        trusted-networks list."""
+        self._auto_watcher.set_trusted(self.cfg.trusted_networks)
+        if self.cfg.auto_profile_switch:
+            self._auto_watcher.start()
+        else:
+            self._auto_watcher.stop()
+
+    def _on_auto_profile(self, profile: Profile) -> None:
+        # Drive the combo so the UI stays in sync; it triggers _on_profile_change.
+        for i, (p, _) in enumerate(_PROFILES):
+            if p == profile:
+                if self.profile_combo.currentIndex() != i:
+                    self.profile_combo.setCurrentIndex(i)
+                break
 
     # ── Refresh timer ────────────────────────────────────────────────────
 

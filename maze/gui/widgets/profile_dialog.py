@@ -17,6 +17,7 @@ class ProfileDialog(QDialog):
         ("hide_hostname",      "Hide hostname (disable mDNS)"),
         ("fingerprint_protect","TCP fingerprint protection"),
         ("block_incoming",     "Block unsolicited incoming connections"),
+        ("block_services",     "Block mDNS/NetBIOS service leaks"),
         ("doh_enabled",        "DNS-over-HTTPS (leak prevention)"),
     ]
 

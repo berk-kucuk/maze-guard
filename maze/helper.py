@@ -1,5 +1,5 @@
 """
-Maze Network privileged helper.
+Maze Guard privileged helper.
 
 Runs as root — normally as a systemd system service (daemon mode) so the GUI
 never has to handle a sudo password. Access to its control socket is gated by
@@ -26,13 +26,33 @@ _GROUP     = "maze"
 _MAC_RE    = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
 _IP_RE     = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')
 _IFACE_RE  = re.compile(r'^[a-zA-Z0-9_\-]{1,15}$')
-_TABLE_RE  = re.compile(r'^[a-zA-Z0-9_\-]{1,32}$')
 _NFT_OPS        = {"add", "delete", "list", "flush", "get"}
 _SYSCTL_ALLOWED = {
     "net.ipv4.ip_default_ttl",
     "net.ipv4.tcp_window_scaling",
 }
+# nftables tables the helper is allowed to touch. Everything else on the system
+# firewall is off-limits even to maze-group members.
+_FW_TABLES      = {"maze_firewall", "maze_shield"}
+# systemd units the helper may stop/start (hostname/mDNS hiding).
+_SVC_ALLOWED    = {"avahi-daemon"}
+_SVC_ACTIONS    = {"stop", "start", "is-active"}
 SO_PEERCRED = 17
+
+
+def _nft_table_allowed(args: list) -> bool:
+    """True if an `nft ... inet <table> ...` command targets only an allowed table.
+
+    Commands that don't name a table after `inet` (e.g. `nft list ruleset`) are
+    rejected here and must go through dedicated read-only handlers instead.
+    """
+    try:
+        idx = args.index("inet")
+    except ValueError:
+        return False
+    if idx + 1 >= len(args):
+        return False
+    return args[idx + 1] in _FW_TABLES
 
 _clients: list[asyncio.StreamWriter] = []
 _loop: asyncio.AbstractEventLoop | None = None
@@ -180,8 +200,8 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
 
             elif cmd == "nft_delete":
                 table = req.get("table", "")
-                if not _TABLE_RE.match(table):
-                    resp["err"] = "invalid table name"
+                if table not in _FW_TABLES:
+                    resp["err"] = "table not allowed"
                 else:
                     r = subprocess.run(["nft", "delete", "table", "inet", table],
                                        capture_output=True, text=True)
@@ -189,12 +209,53 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
 
             elif cmd == "fw_cmd":
                 args = req.get("args", [])
-                if (isinstance(args, list) and len(args) >= 2
+                if not (isinstance(args, list) and len(args) >= 2
                         and args[0] == "nft" and args[1] in _NFT_OPS):
+                    resp["err"] = f"disallowed nft op: {args[1] if len(args) > 1 else '?'}"
+                elif not _nft_table_allowed(args):
+                    resp["err"] = "nft command targets a table outside maze scope"
+                else:
                     r = subprocess.run(args, capture_output=True, text=True)
                     resp.update(ok=r.returncode == 0, err=r.stderr.strip())
+
+            elif cmd == "svc":
+                action = req.get("action", "")
+                unit   = req.get("unit", "")
+                if unit not in _SVC_ALLOWED or action not in _SVC_ACTIONS:
+                    resp["err"] = "service or action not allowed"
                 else:
-                    resp["err"] = f"disallowed nft op: {args[1] if len(args) > 1 else '?'}"
+                    r = subprocess.run(["systemctl", action, unit],
+                                       capture_output=True, text=True)
+                    # is-active returns non-zero when inactive — that's not an error,
+                    # the caller inspects `data` instead.
+                    resp.update(ok=(action == "is-active" or r.returncode == 0),
+                                data=r.stdout.strip(), err=r.stderr.strip())
+
+            elif cmd == "proc_conns":
+                # Build the full connection→process map from root so the GUI can
+                # attribute connections owned by other users (incl. root daemons),
+                # which an unprivileged /proc scan cannot see.
+                try:
+                    from maze.protection.process_map import (
+                        _read_proc_net_tcp, _build_inode_map, _unwrap_mapped)
+                    inode_map = _build_inode_map()
+                    conns = []
+                    for entry in _read_proc_net_tcp():
+                        rip = _unwrap_mapped(entry["remote_ip"])
+                        if rip in ("0.0.0.0", "::", "::ffff:0.0.0.0"):
+                            continue
+                        res = inode_map.get(entry["inode"])
+                        if not res:
+                            continue
+                        pid, name = res
+                        conns.append({
+                            "pid": pid, "process": name,
+                            "local": entry["local"], "remote_ip": rip,
+                            "remote_port": entry["remote_port"],
+                        })
+                    resp.update(ok=True, data=conns)
+                except Exception as e:
+                    resp["err"] = str(e)
 
             elif cmd == "fw_list":
                 import re as _re

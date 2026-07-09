@@ -120,9 +120,11 @@ class ProcessNetworkMonitor:
         self._whitelist = set(whitelist or [])
         self._bus: EventBus | None = None
         self._task: asyncio.Task | None = None
+        self._helper = None
 
-    async def start(self, bus: EventBus) -> None:
+    async def start(self, bus: EventBus, helper=None) -> None:
         self._bus = bus
+        self._helper = helper
         self._task = asyncio.create_task(self._monitor())
 
     async def stop(self) -> None:
@@ -130,6 +132,21 @@ class ProcessNetworkMonitor:
             self._task.cancel()
 
     async def snapshot(self) -> list[Connection]:
+        # With the privileged helper we get every process's connections
+        # (including root daemons); an unprivileged /proc scan only sees the
+        # current user's, silently missing connections owned by others.
+        if self._helper and self._helper.is_connected():
+            conns = await self._helper.proc_conns()
+            if conns is not None:
+                return [
+                    Connection(
+                        pid=c["pid"], process=c["process"],
+                        local_addr=c["local"],
+                        remote_addr=f"{c['remote_ip']}:{c['remote_port']}",
+                        remote_ip=c["remote_ip"], remote_port=c["remote_port"],
+                    )
+                    for c in conns
+                ]
         return await asyncio.to_thread(self._build_snapshot)
 
     def _build_snapshot(self) -> list[Connection]:

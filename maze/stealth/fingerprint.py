@@ -15,11 +15,10 @@ class FingerprintProtector:
 
     async def start(self, bus, helper=None) -> None:
         self._helper = helper
-        if helper and helper.is_connected():
-            await self._apply_via_helper(helper)
-        else:
-            log.warning("FingerprintProtector: privileged helper not available, "
-                        "TCP fingerprint hardening skipped")
+        if not (helper and helper.is_connected()):
+            raise PermissionError(
+                "FingerprintProtector needs the privileged helper to tune sysctl")
+        await self._apply_via_helper(helper)
 
     async def stop(self) -> None:
         if self._helper and self._helper.is_connected() and self._original:

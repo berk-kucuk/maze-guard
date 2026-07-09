@@ -125,6 +125,16 @@ class HelperClient:
         r = await self._send({"cmd": "fw_list"})
         return r.get("data", {"ips": [], "ports_tcp": [], "ports_udp": []}) if r.get("ok") else {"ips": [], "ports_tcp": [], "ports_udp": []}
 
+    async def svc(self, action: str, unit: str) -> tuple[bool, str]:
+        """Run an allowlisted systemctl action. Returns (ok, stdout)."""
+        r = await self._send({"cmd": "svc", "action": action, "unit": unit})
+        return bool(r.get("ok")), r.get("data", "")
+
+    async def proc_conns(self) -> list[dict] | None:
+        """Full connection→process map built root-side, or None if unavailable."""
+        r = await self._send({"cmd": "proc_conns"})
+        return r.get("data") if r.get("ok") else None
+
     async def sysctl_get(self, key: str) -> str | None:
         r = await self._send({"cmd": "sysctl_get", "key": key})
         return r.get("data") if r.get("ok") else None

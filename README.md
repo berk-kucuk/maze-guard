@@ -1,6 +1,6 @@
 <div align="center">
 
-# MAZE NETWORK
+# MAZE GUARD
 
 **Public WiFi Security Monitor**
 
@@ -21,9 +21,9 @@
 
 ---
 
-## What is Maze Network?
+## What is Maze Guard?
 
-Maze Network is a Linux desktop application that monitors your network in real time and alerts you to threats commonly found on public WiFi networks — coffee shops, airports, hotels. It detects active attacks (ARP spoofing, port scans, Evil Twin APs, DNS poisoning), manages a safe nftables firewall, and gives you one-click tools to block IPs and ports without breaking your internet connection.
+Maze Guard is a Linux desktop application that monitors your network in real time and alerts you to threats commonly found on public WiFi networks — coffee shops, airports, hotels. It detects active attacks (ARP spoofing, port scans, Evil Twin APs, DNS poisoning), manages a safe nftables firewall, and gives you one-click tools to block IPs and ports without breaking your internet connection.
 
 The GUI runs as your normal user. A small privileged helper runs as a **systemd daemon** (root) that handles packet capture, firewall rules, and MAC address changes. Because the daemon is started by systemd, the GUI never needs your password — credential handling is removed entirely, which closes off the password-prompt privilege-escalation surface.
 
@@ -118,7 +118,7 @@ paru -S maze
 yay -S maze
 ```
 
-The AUR package installs Maze Network to `/opt/maze` and creates an isolated Python venv at `/opt/maze/venv` — no system Python packages are modified.
+The AUR package installs Maze Guard to `/opt/maze` and creates an isolated Python venv at `/opt/maze/venv` — no system Python packages are modified.
 
 ---
 
@@ -168,7 +168,7 @@ python main.py
 
 ## First Launch
 
-Maze Network **never asks for a password**. A system install registers the privileged helper as a systemd service (`maze.service`) that starts at boot, and the GUI simply connects to it over `/run/maze/maze.sock`.
+Maze Guard **never asks for a password**. A system install registers the privileged helper as a systemd service (`maze.service`) that starts at boot, and the GUI simply connects to it over `/run/maze/maze.sock`.
 
 A `maze` group gates access to that socket, and your user is added to it during install. **Log out and back in once** (or run `newgrp maze`) so your desktop session picks up the new group membership — until then the GUI runs in limited (detection-only) mode.
 
@@ -213,7 +213,7 @@ In the **Events** tab, click **Export** to save the currently visible events (re
 
 ### Autostart
 
-The installer adds an autostart entry (`maze.desktop` with `Exec=maze --background`) so Maze Network launches **hidden in the system tray** on every login — the detection engine starts in the background without opening a window. Click the tray icon to show the dashboard; closing the window minimizes it back to the tray. System installs write `/etc/xdg/autostart/maze.desktop`; user installs write `~/.config/autostart/maze.desktop`.
+The installer adds an autostart entry (`maze.desktop` with `Exec=maze --background`) so Maze Guard launches **hidden in the system tray** on every login — the detection engine starts in the background without opening a window. Click the tray icon to show the dashboard; closing the window minimizes it back to the tray. System installs write `/etc/xdg/autostart/maze.desktop`; user installs write `~/.config/autostart/maze.desktop`.
 
 ---
 
@@ -262,7 +262,7 @@ Dangerous events trigger a **desktop notification** via the system tray and auto
 - **No password in the GUI, no polkit, no setcap, no SUID bit.** The privileged helper runs as a systemd-managed root daemon; the GUI only talks to it over a Unix socket. The GUI never handles credentials, so a malicious app cannot phish a sudo password through it, and a compromised GUI process cannot escalate beyond what the helper exposes.
 - **Helper allowlist.** Only six nft operations are permitted (`add`, `delete`, `list`, `flush`, `get`). Every input (MAC, IP, interface name, table name, sysctl key) is validated with strict regex before reaching any subprocess call.
 - **Group-gated socket + peer verification.** The socket is `root:maze` mode `0660`, so only `maze`-group members can open it, and the helper additionally re-checks each caller's group membership via `SO_PEERCRED`. Arbitrary local processes cannot send commands.
-- **`policy accept` firewall.** Maze Network's nftables table never drops traffic globally. It only drops explicitly blocked IPs/ports. Deleting the table restores the original state instantly.
+- **`policy accept` firewall.** Maze Guard's nftables table never drops traffic globally. It only drops explicitly blocked IPs/ports. Deleting the table restores the original state instantly.
 - **No auto-blocking.** Detection modules never automatically block traffic. All blocking is user-initiated (right-click, Firewall tab). The philosophy: alert and inform, never silently cut connections.
 
 ---

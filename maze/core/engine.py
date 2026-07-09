@@ -85,7 +85,7 @@ class MazeEngine:
         await self.bus.emit(Event(
             type=EventType.ENGINE_READY,
             level=ThreatLevel.SAFE,
-            message="Maze Network engine started",
+            message="Maze Guard engine started",
         ))
 
     async def stop(self) -> None:
@@ -99,34 +99,70 @@ class MazeEngine:
     # Profile management
     # ------------------------------------------------------------------
 
-    async def apply_profile(self, profile: Profile) -> None:
-        # Stop all currently active modules
+    @staticmethod
+    def _plan_from_config(pcfg) -> tuple[list[str], bool]:
+        """Translate a profile/custom-profile config into a module start-list
+        plus whether the incoming-block shield should be enabled.
+
+        Uses getattr so it works for both ProfileConfig and CustomProfileConfig.
+        Passive detection (ARP/rogue-AP/TLS/SSL-strip/DNS-leak) is always on;
+        the rest is gated on the profile's flags.
+        """
+        to_start = ["arp_watch", "rogue_ap", "tls", "ssl_strip", "dns_leak"]
+        if getattr(pcfg, "doh_enabled", True):
+            to_start.append("dns_validate")
+        if getattr(pcfg, "port_scan_detect", True):
+            to_start.append("port_scan")
+        if getattr(pcfg, "process_monitor", True):
+            to_start.append("process")
+        if getattr(pcfg, "mac_randomize", False):
+            to_start.append("mac")
+        if getattr(pcfg, "hide_hostname", False):
+            to_start.append("hostname")
+        if getattr(pcfg, "fingerprint_protect", False):
+            to_start.append("fingerprint")
+        if getattr(pcfg, "block_services", False):
+            to_start.append("service_blocker")
+        return to_start, bool(getattr(pcfg, "block_incoming", False))
+
+    async def _set_incoming_block(self, enabled: bool) -> None:
+        fw = self._fw()
+        if not fw:
+            return
+        try:
+            if enabled:
+                await fw.enable_incoming_block()
+            else:
+                await fw.disable_incoming_block()
+        except Exception as exc:
+            log.warning(f"incoming-block toggle failed: {exc}")
+
+    async def _apply_plan(self, to_start: list[str], block_incoming: bool,
+                          label: str, profile_value: str) -> None:
+        # Stop everything currently active, then start the profile's set.
+        # Stopping stealth modules restores their side effects (avahi restarts,
+        # sysctl restored, blocked ports removed), giving clean transitions.
         await asyncio.gather(
             *[self._stop_module(k) for k in list(self._active)],
             return_exceptions=True,
         )
-
-        pcfg = PROFILES[profile]
-
-        # Profiles only control detection — never auto-apply system changes.
-        # Firewall rules and MAC randomization are user-triggered from the
-        # Protection tab; they must never activate silently.
-        to_start = ["arp_watch", "rogue_ap", "dns_validate", "tls", "ssl_strip", "dns_leak"]
-
-        if pcfg.port_scan_detect:
-            to_start.append("port_scan")
-        if pcfg.process_monitor:
-            to_start.append("process")
-
         for key in to_start:
             await self._start_module(key)
+        await self._set_incoming_block(block_incoming)
 
+        started = sorted(self._active)
         await self.bus.emit(Event(
             type=EventType.PROFILE_CHANGED,
             level=ThreatLevel.SAFE,
-            message=f"Profile activated: {profile.value}",
-            data={"profile": profile.value, "modules": to_start},
+            message=f"{label}: {profile_value}",
+            data={"profile": profile_value, "modules": started,
+                  "block_incoming": block_incoming},
         ))
+
+    async def apply_profile(self, profile: Profile) -> None:
+        to_start, block_incoming = self._plan_from_config(PROFILES[profile])
+        await self._apply_plan(to_start, block_incoming,
+                               "Profile activated", profile.value)
 
     def _on_profile_change(self, profile: Profile) -> None:
         asyncio.create_task(self.apply_profile(profile))
@@ -306,25 +342,8 @@ class MazeEngine:
             await fw.flush()
 
     async def apply_custom_profile(self, profile_cfg) -> None:
-        """Apply a CustomProfileConfig — detection only, no auto-system-changes."""
-        await asyncio.gather(
-            *[self._stop_module(k) for k in list(self._active)],
-            return_exceptions=True,
-        )
-
-        to_start = ["arp_watch", "rogue_ap", "dns_validate", "tls", "ssl_strip", "dns_leak"]
-        if getattr(profile_cfg, "port_scan_detect", True):
-            to_start.append("port_scan")
-        if getattr(profile_cfg, "process_monitor", True):
-            to_start.append("process")
-
-        for key in to_start:
-            await self._start_module(key)
-
-        from maze.core.events import Event, EventType, ThreatLevel
-        await self.bus.emit(Event(
-            type=EventType.PROFILE_CHANGED,
-            level=ThreatLevel.SAFE,
-            message=f"Custom profile activated: {getattr(profile_cfg, 'name', '?')}",
-            data={"profile": getattr(profile_cfg, 'name', '?'), "modules": to_start},
-        ))
+        """Apply a CustomProfileConfig, honouring all of its flags."""
+        to_start, block_incoming = self._plan_from_config(profile_cfg)
+        await self._apply_plan(to_start, block_incoming,
+                               "Custom profile activated",
+                               getattr(profile_cfg, "name", "?"))

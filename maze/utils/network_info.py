@@ -82,6 +82,45 @@ def get_active_vpn_interfaces() -> list[str]:
     return sorted(vpns)
 
 
+def current_network_id(iface: str) -> str:
+    """A stable identifier for the network currently attached to `iface`.
+
+    WiFi networks are identified by SSID; wired networks by the default
+    gateway's MAC address. Returns "" if nothing can be determined (link down).
+    Used by the auto-profile watcher to tell trusted networks apart.
+    """
+    # WiFi: SSID is the natural identity.
+    if (Path("/sys/class/net") / iface / "wireless").exists():
+        try:
+            ssid = subprocess.check_output(
+                ["iwgetid", iface, "--raw"], text=True,
+                timeout=2, stderr=subprocess.DEVNULL,
+            ).strip()
+            if ssid:
+                return f"wifi:{ssid}"
+        except Exception:
+            pass
+    # Wired (or SSID unavailable): use the gateway MAC.
+    try:
+        route = subprocess.check_output(
+            ["ip", "route", "show", "default", "dev", iface],
+            text=True, timeout=2, stderr=subprocess.DEVNULL,
+        )
+        m = re.search(r"default via (\S+)", route)
+        if m:
+            gw = m.group(1)
+            neigh = subprocess.check_output(
+                ["ip", "neigh", "show", gw], text=True,
+                timeout=2, stderr=subprocess.DEVNULL,
+            )
+            mac = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
+            if mac:
+                return f"gw:{mac.group(1)}"
+    except Exception:
+        pass
+    return ""
+
+
 def get_interface_info(iface: str) -> InterfaceInfo:
     info = InterfaceInfo(name=iface)
     try:

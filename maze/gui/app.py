@@ -21,8 +21,8 @@ def _start_hidden(argv: list[str]) -> bool:
 
 def run() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("Maze Network")
-    app.setApplicationDisplayName("Maze Network")
+    app.setApplicationName("Maze Guard")
+    app.setApplicationDisplayName("Maze Guard")
     app.setOrganizationName("maze")
     app.setWindowIcon(create_app_icon(64))
 

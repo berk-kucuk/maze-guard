@@ -14,7 +14,7 @@ _AUTOSTART_PATH = Path.home() / ".config" / "autostart" / "maze.desktop"
 _AUTOSTART_TEMPLATE = """\
 [Desktop Entry]
 Type=Application
-Name=Maze Network
+Name=Maze Guard
 Exec={python} {script} --background
 Hidden=false
 NoDisplay=false
@@ -25,15 +25,18 @@ _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')
 
 
 class SettingsView(QWidget):
-    def __init__(self, state, engine, cfg, save_cb):
+    def __init__(self, state, engine, cfg, save_cb, on_auto_profile_change=None):
         """
         save_cb: callable() — called after any setting change to persist config
+        on_auto_profile_change: callable() — called after the auto-profile toggle
+            or trusted-networks list changes, so the watcher can reconfigure.
         """
         super().__init__()
         self._state   = state
         self._engine  = engine
         self._cfg     = cfg
         self._save_cb = save_cb
+        self._on_auto_profile_change = on_auto_profile_change or (lambda: None)
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -50,6 +53,7 @@ class SettingsView(QWidget):
         layout.setSpacing(20)
 
         layout.addWidget(self._build_general_group())
+        layout.addWidget(self._build_auto_profile_group())
         layout.addWidget(self._build_processes_group())
         layout.addWidget(self._build_whitelist_group())
         layout.addWidget(self._build_system_group())
@@ -104,6 +108,79 @@ class SettingsView(QWidget):
         if mac_mod:
             mac_mod.rotation_seconds = val * 60
         self._save_cb()
+
+    # ── Auto profile ───────────────────────────────────────────────────────
+
+    def _build_auto_profile_group(self) -> QGroupBox:
+        grp = QGroupBox("Automatic Profile Switching")
+        layout = QVBoxLayout(grp)
+        layout.setSpacing(8)
+
+        self._auto_cb = QCheckBox(
+            "Switch to Public on unknown networks, Home on trusted ones")
+        self._auto_cb.setChecked(bool(self._cfg.auto_profile_switch))
+        self._auto_cb.toggled.connect(self._on_auto_toggle)
+        layout.addWidget(self._auto_cb)
+
+        row = QHBoxLayout()
+        self._trust_btn = QPushButton("Trust current network")
+        self._trust_btn.clicked.connect(self._trust_current_network)
+        row.addWidget(self._trust_btn)
+        self._trust_status = QLabel("")
+        self._trust_status.setStyleSheet("font-size: 11px; color: #888;")
+        row.addWidget(self._trust_status)
+        row.addStretch()
+        layout.addLayout(row)
+
+        self._trusted_table = QTableWidget(0, 2)
+        self._trusted_table.setHorizontalHeaderLabels(["Trusted network", "Remove"])
+        self._trusted_table.verticalHeader().setVisible(False)
+        self._trusted_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._trusted_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self._trusted_table.setColumnWidth(1, 80)
+        self._trusted_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._trusted_table.setMaximumHeight(150)
+        layout.addWidget(self._trusted_table)
+
+        self._populate_trusted()
+        return grp
+
+    def _on_auto_toggle(self, enabled: bool) -> None:
+        self._cfg.auto_profile_switch = enabled
+        self._save_cb()
+        self._on_auto_profile_change()
+
+    def _trust_current_network(self) -> None:
+        from maze.utils.network_info import current_network_id
+        net_id = current_network_id(self._cfg.interface)
+        if not net_id:
+            self._trust_status.setText("No network detected")
+            return
+        if net_id not in self._cfg.trusted_networks:
+            self._cfg.trusted_networks.append(net_id)
+            self._save_cb()
+            self._on_auto_profile_change()
+            self._populate_trusted()
+        self._trust_status.setText(f"Trusted: {net_id}")
+
+    def _populate_trusted(self) -> None:
+        self._trusted_table.setRowCount(0)
+        for net_id in self._cfg.trusted_networks:
+            row = self._trusted_table.rowCount()
+            self._trusted_table.insertRow(row)
+            self._trusted_table.setItem(row, 0, QTableWidgetItem(net_id))
+            btn = QPushButton("Remove")
+            btn.setFixedHeight(24)
+            btn.setStyleSheet("font-size: 11px;")
+            btn.clicked.connect(lambda _, n=net_id: self._remove_trusted(n))
+            self._trusted_table.setCellWidget(row, 1, btn)
+
+    def _remove_trusted(self, net_id: str) -> None:
+        if net_id in self._cfg.trusted_networks:
+            self._cfg.trusted_networks.remove(net_id)
+            self._save_cb()
+            self._on_auto_profile_change()
+        self._populate_trusted()
 
     # ── Known Processes ────────────────────────────────────────────────────
 
@@ -242,7 +319,7 @@ class SettingsView(QWidget):
         layout = QVBoxLayout(grp)
         layout.setSpacing(10)
 
-        self._autostart_cb = QCheckBox("Launch Maze Network automatically on login (hidden in tray)")
+        self._autostart_cb = QCheckBox("Launch Maze Guard automatically on login (hidden in tray)")
         self._autostart_cb.setChecked(_AUTOSTART_PATH.exists())
         self._autostart_cb.toggled.connect(self._toggle_autostart)
         layout.addWidget(self._autostart_cb)

@@ -36,8 +36,12 @@ class MACChanger:
         self._helper = None
 
     async def start(self, bus: EventBus, helper=None) -> None:
+        import os
         self._bus = bus
         self._helper = helper
+        if not (helper and helper.is_connected()) and os.getuid() != 0:
+            raise PermissionError(
+                "MACChanger needs the privileged helper (or root) to change the MAC")
         # Do not randomize immediately — only rotate on schedule.
         # Immediate MAC change breaks DHCP and active connections.
         self._task = asyncio.create_task(self._rotate())

@@ -22,6 +22,7 @@ class CustomProfileConfig:
     port_scan_detect: bool = True
     process_monitor: bool = True
     fingerprint_protect: bool = False
+    block_services: bool = False
 
     def to_dict(self) -> dict:
         import dataclasses
@@ -39,6 +40,7 @@ class MazeConfig:
     port_scan_threshold: int = 25
     theme: str = "dark"
     language: str = "en"
+    auto_profile_switch: bool = False
     known_processes: list = field(default_factory=lambda: [
         # Browsers
         "firefox", "chromium", "brave", "brave-browser", "chrome",

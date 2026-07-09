@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  Maze Network — privileged helper daemon setup
+#  Maze Guard — privileged helper daemon setup
 #
 #  Installs the helper as a root systemd service so the GUI never has to ask for
 #  a sudo password. Works directly against this source checkout (dev mode) — no
@@ -62,7 +62,7 @@ fi
 info "Writing ${SERVICE_PATH}"
 cat > "$SERVICE_PATH" <<UNIT
 [Unit]
-Description=Maze Network privileged helper
+Description=Maze Guard privileged helper
 Documentation=https://github.com/berk-kucuk/maze
 After=network.target
 

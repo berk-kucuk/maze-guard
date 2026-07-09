@@ -1,5 +1,5 @@
 """
-Connection to the Maze Network privileged helper.
+Connection to the Maze Guard privileged helper.
 
 The helper runs as a root systemd service (daemon mode); the GUI always stays
 in the normal user session and simply connects to the helper's socket. No sudo

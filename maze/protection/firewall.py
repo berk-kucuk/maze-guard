@@ -29,6 +29,21 @@ table inet maze_firewall {
 
 _TABLE = "inet maze_firewall"
 
+# Separate, self-contained table used only by the "block incoming" profile
+# option. Kept apart from maze_firewall so enabling/disabling it never touches
+# the user's explicit IP/port blocks. Allows established/related + loopback,
+# drops unsolicited new inbound connections — safe for a client machine.
+_SHIELD_RULESET = """
+table inet maze_shield {
+    chain input {
+        type filter hook input priority filter - 5; policy accept;
+        ct state established,related accept
+        iif lo accept
+        ct state new drop
+    }
+}
+"""
+
 
 class FirewallManager:
     def __init__(self):
@@ -87,6 +102,18 @@ class FirewallManager:
         return await self._nft_run(
             ["nft", "delete", "element", "inet", "maze_firewall",
              set_name, "{", str(port), "}"]
+        )
+
+    # ── incoming shield (profile-driven) ──────────────────────────────────
+
+    async def enable_incoming_block(self) -> bool:
+        """Drop unsolicited inbound connections (established/related still flow)."""
+        return await self._nft_apply(_SHIELD_RULESET)
+
+    async def disable_incoming_block(self) -> bool:
+        """Remove the incoming shield, restoring the default accept behaviour."""
+        return await self._nft_run(
+            ["nft", "delete", "table", "inet", "maze_shield"]
         )
 
     async def list_rules(self) -> dict:

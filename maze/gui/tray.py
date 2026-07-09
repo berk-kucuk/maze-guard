@@ -8,7 +8,7 @@ class SystemTray(QObject):
         super().__init__()
         self._tray = QSystemTrayIcon()
         self._tray.setIcon(create_app_icon(64))
-        self._tray.setToolTip("Maze Network")
+        self._tray.setToolTip("Maze Guard")
 
         menu = QMenu()
         menu.addAction("Show").triggered.connect(on_show)
