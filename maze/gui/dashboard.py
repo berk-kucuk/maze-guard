@@ -125,6 +125,12 @@ class Dashboard(QMainWindow):
         self.profile_combo.blockSignals(True)
         for _, i18n_key in _PROFILES:
             self.profile_combo.addItem(self.state.t(i18n_key))
+        # Reflect the persisted startup profile (applied by app.run) so the
+        # combo matches what the engine is actually running.
+        for i, (p, _) in enumerate(_PROFILES):
+            if p.value == getattr(self.cfg, "profile", "home"):
+                self.profile_combo.setCurrentIndex(i)
+                break
         self.profile_combo.blockSignals(False)
         self.profile_combo.currentIndexChanged.connect(self._on_profile_change)
         layout.addWidget(self.profile_combo)
@@ -328,6 +334,9 @@ class Dashboard(QMainWindow):
         if index < len(_PROFILES):
             profile = _PROFILES[index][0]
             self.engine.profiles.set(profile)
+            # Persist so the choice is restored on next launch.
+            self.cfg.profile = profile.value
+            save_config(self.cfg)
         else:
             custom_idx = index - len(_PROFILES)
             custom_profiles = getattr(self, '_custom_profiles', self.cfg.custom_profiles)

@@ -3,7 +3,7 @@
 #  Maze Guard — Security Monitor  •  Installer
 #  Supports: Arch, Debian/Ubuntu, Fedora, RHEL, openSUSE (and derivatives)
 #  Usage:
-#    sudo ./install.sh          — system-wide install to /opt/maze
+#    sudo ./install.sh          — system-wide install to /opt/maze-guard
 #    ./install.sh --user        — user install to ~/.local (no root needed)
 #    sudo ./install.sh --uninstall   — remove a system install
 # =============================================================================
@@ -48,7 +48,7 @@ for arg in "$@"; do
     --help|-h)
       echo "Usage: $0 [--user] [--uninstall]"
       echo ""
-      echo "  (no flags)    System-wide install to /opt/maze  [requires root]"
+      echo "  (no flags)    System-wide install to /opt/maze-guard  [requires root]"
       echo "  --user        User install to ~/.local           [no root needed]"
       echo "  --uninstall   Remove a previously installed Maze Guard [requires root for system install]"
       exit 0
@@ -57,18 +57,18 @@ for arg in "$@"; do
 done
 
 # ── Install paths ─────────────────────────────────────────────────────────────
-SERVICE_FILE="/etc/systemd/system/maze.service"
+SERVICE_FILE="/etc/systemd/system/maze-guard.service"
 MAZE_GROUP="maze"
 
 if $USER_MODE; then
-  INSTALL_DIR="$HOME/.local/share/maze"
+  INSTALL_DIR="$HOME/.local/share/maze-guard"
   BIN_DIR="$HOME/.local/bin"
   ICON_HICOLOR="$HOME/.local/share/icons/hicolor"
   DESKTOP_DIR="$HOME/.local/share/applications"
   AUTOSTART_DIR="$HOME/.config/autostart"
   NEED_ROOT=false
 else
-  INSTALL_DIR="/opt/maze"
+  INSTALL_DIR="/opt/maze-guard"
   BIN_DIR="/usr/local/bin"
   ICON_HICOLOR="/usr/share/icons/hicolor"
   DESKTOP_DIR="/usr/share/applications"
@@ -78,7 +78,7 @@ fi
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CURRENT_USER="${SUDO_USER:-$USER}"
-LAUNCHER="$BIN_DIR/maze"
+LAUNCHER="$BIN_DIR/maze-guard"
 
 # ── Root check ────────────────────────────────────────────────────────────────
 if $NEED_ROOT && [[ $EUID -ne 0 ]]; then
@@ -91,13 +91,13 @@ do_uninstall() {
 
   # Stop & remove the privileged helper daemon (system install only)
   if $NEED_ROOT && command -v systemctl &>/dev/null; then
-    systemctl disable --now maze.service 2>/dev/null || true
-    [[ -f "$SERVICE_FILE" ]] && { rm -f "$SERVICE_FILE"; systemctl daemon-reload; info "Removed maze.service"; }
+    systemctl disable --now maze-guard.service 2>/dev/null || true
+    [[ -f "$SERVICE_FILE" ]] && { rm -f "$SERVICE_FILE"; systemctl daemon-reload; info "Removed maze-guard.service"; }
     rm -rf /run/maze
   fi
 
   local dirs=("$INSTALL_DIR")
-  local files=("$LAUNCHER" "$DESKTOP_DIR/maze.desktop" "$AUTOSTART_DIR/maze.desktop")
+  local files=("$LAUNCHER" "$DESKTOP_DIR/maze-guard.desktop" "$AUTOSTART_DIR/maze-guard.desktop")
 
   for f in "${files[@]}"; do
     [[ -f "$f" ]] && { rm -f "$f"; info "Removed $f"; }
@@ -108,7 +108,7 @@ do_uninstall() {
 
   # Remove icons
   for size in 16 32 48 64 128 256 512; do
-    rm -f "$ICON_HICOLOR/${size}x${size}/apps/maze.png"
+    rm -f "$ICON_HICOLOR/${size}x${size}/apps/maze-guard.png"
   done
   command -v gtk-update-icon-cache &>/dev/null && \
     gtk-update-icon-cache -f -t "$ICON_HICOLOR" 2>/dev/null || true
@@ -328,10 +328,10 @@ install_icons() {
     mkdir -p "$dir"
     if command -v convert &>/dev/null; then
       convert -resize "${size}x${size}" \
-        "$INSTALL_DIR/MAZE.png" "$dir/maze.png" 2>/dev/null \
-        || cp "$INSTALL_DIR/MAZE.png" "$dir/maze.png"
+        "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png" 2>/dev/null \
+        || cp "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png"
     else
-      cp "$INSTALL_DIR/MAZE.png" "$dir/maze.png"
+      cp "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png"
     fi
   done
 
@@ -346,7 +346,7 @@ install_icons() {
 create_desktop_entry() {
   step "Creating .desktop entry"
   mkdir -p "$DESKTOP_DIR"
-  cat > "$DESKTOP_DIR/maze.desktop" << DESKTOP_EOF
+  cat > "$DESKTOP_DIR/maze-guard.desktop" << DESKTOP_EOF
 [Desktop Entry]
 Version=1.1
 Type=Application
@@ -354,18 +354,18 @@ Name=Maze Guard
 GenericName=Network Security Monitor
 Comment=Public WiFi protection — MITM detection, MAC randomization, firewall
 Exec=$LAUNCHER
-Icon=maze
+Icon=maze-guard
 Terminal=false
 Categories=Network;Security;System;
 Keywords=security;wifi;network;firewall;privacy;mitm;vpn;
 StartupNotify=true
-StartupWMClass=maze
+StartupWMClass=maze-guard
 X-GNOME-UsesNotifications=true
 DESKTOP_EOF
-  chmod +x "$DESKTOP_DIR/maze.desktop"
+  chmod +x "$DESKTOP_DIR/maze-guard.desktop"
 
   if command -v desktop-file-validate &>/dev/null; then
-    desktop-file-validate "$DESKTOP_DIR/maze.desktop" 2>/dev/null \
+    desktop-file-validate "$DESKTOP_DIR/maze-guard.desktop" 2>/dev/null \
       && ok ".desktop file validated" \
       || warn ".desktop validation warning (non-fatal)"
   fi
@@ -373,14 +373,14 @@ DESKTOP_EOF
     command -v update-desktop-database &>/dev/null && \
       update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
   fi
-  ok ".desktop entry: $DESKTOP_DIR/maze.desktop"
+  ok ".desktop entry: $DESKTOP_DIR/maze-guard.desktop"
 }
 
 # ── Autostart entry (start hidden in the system tray on login) ──────────────────
 create_autostart_entry() {
   step "Creating autostart entry (background / tray on login)"
   mkdir -p "$AUTOSTART_DIR"
-  cat > "$AUTOSTART_DIR/maze.desktop" << AUTOSTART_EOF
+  cat > "$AUTOSTART_DIR/maze-guard.desktop" << AUTOSTART_EOF
 [Desktop Entry]
 Version=1.1
 Type=Application
@@ -388,15 +388,15 @@ Name=Maze Guard
 GenericName=Network Security Monitor
 Comment=Start Maze Guard minimized in the system tray
 Exec=$LAUNCHER --background
-Icon=maze
+Icon=maze-guard
 Terminal=false
 Categories=Network;Security;System;
 StartupNotify=false
-StartupWMClass=maze
+StartupWMClass=maze-guard
 X-GNOME-Autostart-enabled=true
 AUTOSTART_EOF
-  chmod +x "$AUTOSTART_DIR/maze.desktop"
-  ok "Autostart entry: $AUTOSTART_DIR/maze.desktop"
+  chmod +x "$AUTOSTART_DIR/maze-guard.desktop"
+  ok "Autostart entry: $AUTOSTART_DIR/maze-guard.desktop"
 }
 
 # ── File permissions (system install only) ────────────────────────────────────
@@ -466,12 +466,12 @@ SERVICE_EOF
 
   # 3. enable + start
   systemctl daemon-reload
-  systemctl enable --now maze.service 2>/dev/null || true
+  systemctl enable --now maze-guard.service 2>/dev/null || true
   sleep 1
-  if systemctl is-active --quiet maze.service; then
-    ok "maze.service is running"
+  if systemctl is-active --quiet maze-guard.service; then
+    ok "maze-guard.service is running"
   else
-    warn "maze.service did not start — check: journalctl -u maze.service -e"
+    warn "maze-guard.service did not start — check: journalctl -u maze-guard.service -e"
   fi
 }
 
@@ -491,18 +491,18 @@ fi
 
 echo "Removing Maze Guard..."
 if \$NEED_ROOT && command -v systemctl &>/dev/null; then
-  systemctl disable --now maze.service 2>/dev/null || true
+  systemctl disable --now maze-guard.service 2>/dev/null || true
   rm -f "$SERVICE_FILE"
   systemctl daemon-reload
   rm -rf /run/maze
 fi
 rm -rf "$INSTALL_DIR"
 rm -f  "$LAUNCHER"
-rm -f  "$DESKTOP_DIR/maze.desktop"
-rm -f  "$AUTOSTART_DIR/maze.desktop"
+rm -f  "$DESKTOP_DIR/maze-guard.desktop"
+rm -f  "$AUTOSTART_DIR/maze-guard.desktop"
 
 for size in 16 32 48 64 128 256 512; do
-  rm -f "$ICON_HICOLOR/\${size}x\${size}/apps/maze.png"
+  rm -f "$ICON_HICOLOR/\${size}x\${size}/apps/maze-guard.png"
 done
 command -v gtk-update-icon-cache &>/dev/null && \
   gtk-update-icon-cache -f -t "$ICON_HICOLOR" 2>/dev/null || true
@@ -527,7 +527,7 @@ ensure_rsync() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-  info "Install mode: $( $USER_MODE && echo 'user (~/.local)' || echo 'system (/opt/maze)')"
+  info "Install mode: $( $USER_MODE && echo 'user (~/.local)' || echo 'system (/opt/maze-guard)')"
   info "Install target: $INSTALL_DIR"
   blank
 

@@ -118,17 +118,17 @@ paru -S maze
 yay -S maze
 ```
 
-The AUR package installs Maze Guard to `/opt/maze` and creates an isolated Python venv at `/opt/maze/venv` — no system Python packages are modified.
+The AUR package installs Maze Guard to `/opt/maze-guard` and creates an isolated Python venv at `/opt/maze-guard/venv` — no system Python packages are modified.
 
 ---
 
 ### Any Linux distribution (install script)
 
 ```bash
-git clone https://github.com/USERNAME/maze.git
+git clone https://github.com/berk-kucuk/maze-guard.git
 cd maze
 
-# System-wide install to /opt/maze  (requires root)
+# System-wide install to /opt/maze-guard  (requires root)
 sudo ./install.sh
 
 # Per-user install to ~/.local  (no root needed)
@@ -146,7 +146,7 @@ maze
 To uninstall:
 
 ```bash
-sudo /opt/maze/uninstall.sh
+sudo /opt/maze-guard/uninstall.sh
 ```
 
 ---
@@ -154,7 +154,7 @@ sudo /opt/maze/uninstall.sh
 ### From source (development)
 
 ```bash
-git clone https://github.com/USERNAME/maze.git
+git clone https://github.com/berk-kucuk/maze-guard.git
 cd maze
 
 python3 -m venv venv

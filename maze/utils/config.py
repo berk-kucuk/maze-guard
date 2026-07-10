@@ -40,6 +40,7 @@ class MazeConfig:
     port_scan_threshold: int = 25
     theme: str = "dark"
     language: str = "en"
+    profile: str = "home"
     auto_profile_switch: bool = False
     known_processes: list = field(default_factory=lambda: [
         # Browsers
