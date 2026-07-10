@@ -50,6 +50,11 @@ class MazeConfig:
         "protonvpn-app", "protonvpn", "proton-vpn-gnom", "openvpn",
         "wg", "wg-quick", "nordvpn", "mullvad", "expressvpn",
         "openconnect", "vpnc", "wireguard",
+        # Privacy / anonymity / mesh networking (make their own outbound conns)
+        "tor", "tor-real", "obfs4proxy", "snowflake-clien", "i2pd",
+        "mullvad-daemon", "tailscaled", "tailscale", "zerotier-one",
+        # Time / sync daemons
+        "chronyd", "ntpd", "systemd-timesyn",
         # Music / media streaming
         "spotify", "Spotify", "spotifyd",
         "rhythmbox", "clementine", "strawberry", "lollypop",

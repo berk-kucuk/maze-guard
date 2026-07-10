@@ -1,8 +1,12 @@
 import asyncio
+import re
 import socket
 import struct
+import subprocess
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.utils.logger import log
+
+_IPV4_RE = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
 
 
 def _is_private_ip(ip: str) -> bool:
@@ -46,6 +50,29 @@ def _get_configured_dns_servers() -> set[str]:
                         servers.add(parts[1])
     except Exception:
         pass
+    return servers
+
+
+def _get_resolved_upstreams() -> set[str]:
+    """Real upstream DNS servers configured in systemd-resolved (IPv4 only).
+
+    On systemd-resolved systems /etc/resolv.conf only lists the 127.0.0.53
+    stub; the actual upstreams the user (or DHCP) configured live inside
+    resolved. Without consulting them, every query resolved forwards to its
+    legitimate upstream (e.g. 1.1.1.1 / 1.0.0.1) looks like a DNS hijack.
+    """
+    servers: set[str] = set()
+    try:
+        out = subprocess.check_output(
+            ["resolvectl", "dns"], text=True, timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return servers
+    for ip in _IPV4_RE.findall(out):
+        # Guard against octets > 255 that the loose regex can match.
+        if all(0 <= int(o) <= 255 for o in ip.split(".")):
+            servers.add(ip)
     return servers
 
 
@@ -138,6 +165,7 @@ class DNSLeakPreventer:
             return leaks
 
         configured = _get_configured_dns_servers()
+        resolved_upstreams = _get_resolved_upstreams()
         vpn_ifaces = _get_active_vpn_interfaces()
         vpn_state = frozenset(vpn_ifaces)
 
@@ -170,10 +198,12 @@ class DNSLeakPreventer:
                 )
                 leaks.append((ip, msg))
             else:
-                # No VPN: private IPs are your LAN/router DNS — normal.
-                # Flag only public IPs that don't match resolv.conf,
-                # which may indicate DNS hijacking.
-                if not _is_private_ip(ip):
+                # No VPN: private IPs are your LAN/router DNS — normal, and
+                # systemd-resolved's configured upstreams (which never appear
+                # in resolv.conf, only the 127.0.0.53 stub does) are legit too.
+                # Flag only public IPs that match neither — a real hijack
+                # redirects you to a resolver you never configured.
+                if not _is_private_ip(ip) and ip not in resolved_upstreams:
                     msg = (
                         f"Unexpected DNS server: query to {ip} "
                         f"(not in resolv.conf) — possible DNS hijack"
