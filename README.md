@@ -4,7 +4,7 @@
 
 **Public WiFi Security Monitor**
 
-*MITM detection · MAC randomization · nftables firewall · Packet analysis*
+*MITM detection · firewalld integration · Packet analysis*
 
 ---
 
@@ -23,9 +23,9 @@
 
 ## What is Maze Guard?
 
-Maze Guard is a Linux desktop application that monitors your network in real time and alerts you to threats commonly found on public WiFi networks — coffee shops, airports, hotels. It detects active attacks (ARP spoofing, port scans, Evil Twin APs, DNS poisoning), manages a safe nftables firewall, and gives you one-click tools to block IPs and ports without breaking your internet connection.
+Maze Guard is a Linux desktop application that monitors your network in real time and alerts you to threats commonly found on public WiFi networks — coffee shops, airports, hotels. It detects active attacks (ARP spoofing, port scans, Evil Twin APs, DNS poisoning), manages firewall rules through firewalld, and gives you one-click tools to block IPs and ports without breaking your internet connection.
 
-The GUI runs as your normal user. A small privileged helper runs as a **systemd daemon** (root) that handles packet capture, firewall rules, and MAC address changes. Because the daemon is started by systemd, the GUI never needs your password — credential handling is removed entirely, which closes off the password-prompt privilege-escalation surface.
+The GUI runs as your normal user. A small privileged helper runs as a **systemd daemon** (root) that handles packet capture and firewall rules. Because the daemon is started by systemd, the GUI never needs your password — credential handling is removed entirely, which closes off the password-prompt privilege-escalation surface.
 
 ---
 
@@ -35,7 +35,8 @@ The GUI runs as your normal user. A small privileged helper runs as a **systemd 
 | Module | What it detects |
 |---|---|
 | **ARP Watcher** | ARP spoofing, gateway MAC/IP changes |
-| **Port Scan Detector** | TCP SYN floods from a single source |
+| **Port Scan Detector** | SYN sweeps by distinct-port breadth, plus FIN/NULL/XMAS stealth probes, with per-source evidence (ports, rate, duration) |
+| **Anomaly & Correlation** | ARP host-discovery storms, ICMP ping sweeps and recon probes, rogue DHCP servers, one MAC claiming many IPs — and joins separate detections from one source into a single attack chain |
 | **DNS Validator** | DNS poisoning (cross-checks 3 DoH resolvers) |
 | **DNS Leak Preventer** | Plaintext DNS queries escaping VPN tunnel |
 | **TLS Monitor** | Certificate hash changes for canary hosts |
@@ -46,14 +47,15 @@ The GUI runs as your normal user. A small privileged helper runs as a **systemd 
 ### Protection
 | Feature | Description |
 |---|---|
-| **nftables Firewall** | Named sets with `policy accept` — blocks only what you add, never breaks internet |
-| **MAC Randomization** | Scheduled MAC address rotation via privileged helper |
+| **Firewall Control** | Start/stop firewalld itself, and toggle the inbound-DROP shield, from the Protection tab — with live state read back from the firewall, not remembered in the UI |
+| **firewalld Integration** | Rich rules on the *actual* default zone (IPv4 and IPv6), each carrying a rate-limited kernel log line so every block is auditable |
 | **Hostname Hiding** | Disables mDNS/Avahi to hide device hostname on LAN |
 | **TCP Fingerprint** | Randomizes TTL and TCP window scaling via sysctl |
 | **Service Blocker** | Closes listening services on untrusted networks |
 
 ### Interface
 - **Dashboard** — Live network info, firewall status, threat level, bandwidth monitor (↓/↑ per second), port scan table
+- **Threats** — One dossier per attacking source: severity score, identity (MAC, vendor, hostname, OS), techniques used, ports they probed, what they are running, full timeline, and Block / Scan Source / Export Report actions
 - **Events** — Filterable event log (All / Suspicious / Dangerous), text search, CSV export
 - **Firewall** — Add/remove blocked IPs and ports with instant feedback
 - **Devices** — All discovered LAN devices with MAC addresses
@@ -62,7 +64,8 @@ The GUI runs as your normal user. A small privileged helper runs as a **systemd 
 - **Settings** — Threshold tuning, process whitelist, IP whitelist, autostart toggle
 
 ### Other
-- **IP Reconnaissance** — Auto-triggered on dangerous events: reverse DNS, open port scan, OS fingerprint via TTL
+- **IP Reconnaissance** — Auto-triggered on confirmed attacks (and on demand): reverse DNS, NetBIOS and mDNS names, MAC vendor, ~90-port sweep with service banners, TLS certificate identity, HTTP server and page title, OS fingerprint, latency, and a risk score with plain-language findings ("port 4444 open — Metasploit default handler port"). Only ever runs against on-link private addresses, never a spoofable public source
+- **Incident Records** — Every hostile source is filed to `~/.local/share/maze-guard/`: an append-only evidence journal plus a dossier snapshot that survives restarts, exportable as a Markdown incident report
 - **Custom Profiles** — Create named security profiles with per-feature toggles
 - **Persistent Log** — All events written to `~/.config/maze/maze.log` (rotating, 2 MB × 3)
 - **System Tray** — Starts hidden in the tray on login (autostart); click the tray icon to show the window; desktop notifications for dangerous events
@@ -86,14 +89,15 @@ The GUI runs as your normal user. A small privileged helper runs as a **systemd 
 ┌───────────────────────────┼──────────────────┐
 │  Helper Daemon (root, systemd: maze.service) │
 │                           ▼                  │
-│   scapy (ARP/SYN sniff)  ─────► push events │
-│   nft (firewall rules)                       │
-│   ip link (MAC change)                       │
+│   scapy (ARP/TCP/ICMP/DHCP) ───► push events│
+│   firewalld (firewall rules)                  │
 │   sysctl (TCP fingerprint)                   │
 └──────────────────────────────────────────────┘
 ```
 
-The helper runs as a systemd service and publishes a Unix socket at `/run/maze/maze.sock`, owned `root:maze` with mode `0660`. Only members of the `maze` group can reach it — enforced both by file permissions and an in-process `SO_PEERCRED` group-membership check. All nft operations go through an allowlist (`add`, `delete`, `list`, `flush`, `get`). Input is validated with strict regex before any subprocess call.
+The helper runs as a systemd service and publishes a Unix socket at `/run/maze/maze.sock`, owned `root:maze` with mode `0660`. Only members of the `maze` group can reach it — enforced both by file permissions and an in-process `SO_PEERCRED` group-membership check. All firewall-cmd operations go through a strict allowlist of safe flags (`--add-rich-rule`, `--remove-rich-rule`, `--reload`, `--zone`, `--permanent`, `--list-rich-rules`, `--list-all`, `--set-default-zone`, `--get-default-zone`, `--set-target=DROP|default`) plus known-safe zone names. Any other argument is rejected before reaching a subprocess call.
+
+Rich rules are matched **in full** against fixed patterns rather than by prefix, so a legal-looking `source address=` clause cannot be extended with an `accept`, `masquerade` or `forward-port` action. The action is pinned to `drop`, catch-all sources (`0.0.0.0/0`, `::/0`) are refused so the channel cannot be used to black-hole the host, and the optional log clause is pinned to a `MAZE-` prefix at a capped rate. Service control is a separate command limited to the single unit `firewalld`, and every call is logged by the daemon.
 
 ---
 
@@ -101,7 +105,7 @@ The helper runs as a systemd service and publishes a Unix socket at `/run/maze/m
 
 - **OS:** Linux (kernel 4.x+, any distribution)
 - **Python:** 3.11 or newer
-- **System tools:** `nftables`, `iproute2`, `dbus`
+- **System tools:** `firewalld`, `iproute2`, `dbus`
 - **Optional:** `wireless-tools` (WiFi SSID/BSSID detection), `imagemagick` (icon resizing)
 
 ---
@@ -188,6 +192,22 @@ sudo ./scripts/setup-daemon.sh --uninstall
 
 ## Usage
 
+### Checking that everything works
+
+```bash
+maze-guard --doctor
+```
+
+Exercises every feature against this machine — external tools, the privileged
+helper and whether it is up to date, firewalld and the inbound shield, the
+polkit action and whether an agent can show its prompt, each detection module's
+start/stop, all three DoH resolvers, the TLS canaries and a
+live recon probe — and prints PASS/WARN/FAIL with the fix for anything broken.
+Exit status is non-zero if any check failed, so it can gate a deployment.
+
+The check exists because the failure that matters for a security tool is not a
+crash, it is a module that reports *Active* while silently doing nothing.
+
 ### Profiles
 
 Select a security profile from the top bar:
@@ -205,7 +225,7 @@ You can also create **custom profiles** with the **`+`** button next to the prof
 
 **Right-click** any event in the Events tab or any row in the Dashboard scan table to block the source IP. In the Firewall tab you can add arbitrary IPs/CIDRs and port numbers with TCP/UDP/Both selectors.
 
-All rules use nftables named sets with `policy accept` — the firewall only drops what you explicitly add and never affects outbound traffic.
+All rules use firewalld rich rules with `drop` action — the firewall only drops what you explicitly add and never affects outbound traffic, so you can't accidentally brick your connection by blocking too much.
 
 ### Exporting events
 
@@ -227,7 +247,6 @@ Config is stored at `~/.config/maze/config.json` and is updated automatically wh
   "theme": "dark",
   "language": "en",
   "port_scan_threshold": 10,
-  "mac_rotation_minutes": 30,
   "known_processes": ["firefox", "brave", "curl", "..."],
   "whitelist_ips": [],
   "custom_profiles": []
@@ -238,7 +257,6 @@ Config is stored at `~/.config/maze/config.json` and is updated automatically wh
 |---|---|
 | `interface` | Network interface to monitor (auto-detected if missing or down) |
 | `port_scan_threshold` | SYN packets from one IP before a SUSPICIOUS alert fires |
-| `mac_rotation_minutes` | How often MAC address rotates when MAC randomization is active |
 | `known_processes` | Processes that will never trigger "unknown process" alerts |
 | `whitelist_ips` | IPs ignored by all detectors (gateway, trusted servers, etc.) |
 | `custom_profiles` | User-defined profiles saved from the `+` dialog |
@@ -253,17 +271,21 @@ Config is stored at `~/.config/maze/config.json` and is updated automatically wh
 | **Suspicious** | Orange | Possible threat — DNS disagreement, port scan started, DNS leak |
 | **Dangerous** | Red | Active attack — ARP spoofing, gateway MAC change, port scan escalation |
 
-Dangerous events trigger a **desktop notification** via the system tray and automatically kick off **IP reconnaissance** (reverse DNS + port scan + OS fingerprint) on the attacker's IP.
+Dangerous events trigger a **desktop notification** via the system tray and automatically kick off **reconnaissance** against the attacker (identity, services, OS, risk findings). The result is filed in that source's dossier on the **Threats** tab, where it can be blocked, re-scanned, or exported as an incident report.
 
 ---
 
 ## Security model
 
 - **No password in the GUI, no polkit, no setcap, no SUID bit.** The privileged helper runs as a systemd-managed root daemon; the GUI only talks to it over a Unix socket. The GUI never handles credentials, so a malicious app cannot phish a sudo password through it, and a compromised GUI process cannot escalate beyond what the helper exposes.
-- **Helper allowlist.** Only six nft operations are permitted (`add`, `delete`, `list`, `flush`, `get`). Every input (MAC, IP, interface name, table name, sysctl key) is validated with strict regex before reaching any subprocess call.
-- **Group-gated socket + peer verification.** The socket is `root:maze` mode `0660`, so only `maze`-group members can open it, and the helper additionally re-checks each caller's group membership via `SO_PEERCRED`. Arbitrary local processes cannot send commands.
-- **`policy accept` firewall.** Maze Guard's nftables table never drops traffic globally. It only drops explicitly blocked IPs/ports. Deleting the table restores the original state instantly.
-- **No auto-blocking.** Detection modules never automatically block traffic. All blocking is user-initiated (right-click, Firewall tab). The philosophy: alert and inform, never silently cut connections.
+- **Helper allowlist.** Only a curated set of `firewall-cmd` flags is permitted (`--add-rich-rule`, `--remove-rich-rule`, `--reload`, `--list-all`, `--list-rich-rules`, `--set-default-zone`, `--get-default-zone`, `--set-target=DROP|default`, `--permanent`, `--zone`). Every argument (IP, interface name, zone name, sysctl key) is validated before reaching a subprocess call, and rich rules are matched in full against fixed `drop`-only patterns. Service control is a separate, logged command that can address exactly one unit: `firewalld`.
+- **Group-gated socket + peer verification.** The socket is `root:maze` mode `0660`, so only `maze`-group members can open it, and the helper additionally re-checks each caller's group membership via `SO_PEERCRED`. Processes running as other users cannot send commands.
+- **Adding protection is free; removing it needs consent.** Group membership answers "is this the desktop user?", which is *not* the right question for a destructive request — anything running as that user, invited or not, passes it. So stopping the firewall, lowering the inbound shield and removing a block on an attacker each require polkit authorisation (`org.mazeguard.disable-protection`), and the caller is pinned as `pid,start-time,uid` so a recycled pid cannot inherit somebody else's approval. Blocking an attacker, raising the shield and starting the firewall stay unauthenticated — including the automatic block, which has no user present to answer a prompt. Malware running as you can raise the dialog; it cannot answer it.
+- **No arbitrary execution.** The helper exposes a fixed command set. Every argument is checked against an allowlist or a regex, commands are executed as argument lists (never through a shell), and there is no file-read, file-write or run-anything API. `--set-default-zone` is deliberately absent: Maze Guard never sets the default zone, and permitting it would have allowed `--set-default-zone trusted` — a one-line firewall bypass.
+- **Every state change is audited.** Rule changes, service control and sysctl writes are logged to the journal with the calling `pid`, `uid` and program name (`journalctl -u maze-guard.service`). Read-only polling is not logged, so the lines that matter stay visible.
+- **Default-zone rich rules.** Maze Guard adds and removes explicit rich rules on the *active* default zone, whatever it is. Removing a rule restores the previous state instantly. The one global change it makes is the inbound shield, which sets that zone's target to `DROP`; it is a labelled toggle in the Protection tab, is restored on Quit, and is read back from firewalld rather than remembered, so the button always matches reality.
+- **Auto-blocking is narrow and switchable.** A firewall drop rule is added automatically only for a *confirmed active attack* — a port scan, a stealth (FIN/NULL/XMAS) scan, or two different techniques correlated to one source — and only after reconnaissance. The gateway, DNS servers and whitelisted addresses are never blocked, and public source addresses are ignored entirely because a packet's source IP is trivially forged and blocking on it would let an attacker cut you off from anything they name. Turn it off in Settings → *Automatically block confirmed attackers*; everything else remains alert-and-inform.
+- **Recon only targets on-link private addresses.** For the same spoofing reason, the active scan that builds an attacker dossier never runs against a public IP, and never against infrastructure.
 
 ---
 
@@ -274,8 +296,10 @@ maze/
 ├── core/
 │   ├── engine.py          # Module orchestration, event bus, recon trigger
 │   ├── events.py          # Event types, threat levels
+│   ├── incident.py        # Attacker dossiers, scoring, evidence journal
 │   └── profile.py         # Built-in profile definitions
 ├── detection/
+│   ├── anomaly.py         # Discovery sweeps, rogue DHCP, attack correlation
 │   ├── arp_watch.py       # ARP spoofing + gateway change detection
 │   ├── dns_validator.py   # DoH cross-validation (canary domains)
 │   ├── rogue_ap.py        # Evil Twin + ICMP redirect check
@@ -283,13 +307,12 @@ maze/
 │   └── tls_monitor.py     # TLS cert hash monitoring (canary hosts)
 ├── protection/
 │   ├── dns_leak.py        # Plaintext DNS leak detector
-│   ├── firewall.py        # nftables named-set manager
-│   ├── port_scanner.py    # TCP SYN flood detector
+│   ├── firewall.py        # firewalld control: service, shield, rich rules
+│   ├── port_scanner.py    # SYN-breadth + stealth-flag scan detection
 │   └── process_map.py     # Unknown process connection monitor
 ├── stealth/
 │   ├── fingerprint.py     # TCP fingerprint obfuscation (sysctl via helper)
 │   ├── hostname_hide.py   # mDNS/Avahi disable
-│   ├── mac_changer.py     # Scheduled MAC randomization
 │   └── service_blocker.py # Close listening services
 ├── gui/
 │   ├── dashboard.py       # Main window, tray, session summary
@@ -298,13 +321,14 @@ maze/
 │       ├── dashboard_view.py   # Cards, bandwidth monitor, scan table
 │       ├── event_list.py       # Filterable event log + CSV export
 │       ├── firewall_view.py    # IP/port block manager
-│       ├── settings_view.py    # Thresholds, whitelist, autostart
+│       ├── settings_view.py    # Thresholds, whitelist, autostart, auto-block
+│       ├── threats_view.py     # Attacker dossiers + block/scan/export
 │       └── profile_dialog.py  # Custom profile creator
 ├── utils/
 │   ├── config.py          # Config load/save, CustomProfileConfig
 │   ├── logger.py          # Rotating file + console logger
 │   ├── network_info.py    # Interface info, firewall status
-│   └── recon.py           # Passive IP reconnaissance
+│   └── recon.py           # Attacker reconnaissance + risk scoring
 ├── helper.py              # Privileged daemon (runs as root via systemd)
 └── helper_client.py       # Async client for the helper socket
 ```

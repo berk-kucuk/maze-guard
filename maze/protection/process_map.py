@@ -16,6 +16,34 @@ class Connection:
     remote_addr: str
     remote_ip: str
     remote_port: int
+    exe: str = ""       # basename of /proc/<pid>/exe (real binary), if readable
+    cmdline: str = ""   # full command line — reveals the app behind renamed comm
+
+
+def _proc_cmdline(pid) -> str:
+    """Full command line of ``pid`` (NUL-separated args joined by spaces).
+
+    Readable for one's own processes and by root for all — unlike comm it is
+    NOT renamed by multi-process apps, so it still carries the real identity
+    (e.g. a Bitwarden Electron child shows /usr/lib/bitwarden/app.asar even
+    though its comm is just "electron")."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def _readlink_exe(pid) -> str:
+    """Basename of the process's real executable, or "" if unreadable.
+
+    Sandboxed children (Chromium/Electron) may hide their exe, so callers must
+    treat "" as "unknown" and fall back to cmdline-based identity."""
+    try:
+        target = os.readlink(f"/proc/{pid}/exe")
+        return os.path.basename(target.split(" (deleted)")[0])
+    except Exception:
+        return ""
 
 
 def _hex_to_ip(hex_str: str) -> str:
@@ -86,28 +114,35 @@ def _read_proc_net_tcp() -> list[dict]:
     return entries
 
 
-def _build_inode_map() -> dict[str, tuple[int, str]]:
-    """Scan /proc once to build inode → (pid, name) for all socket fds.
+def _build_inode_map() -> dict[str, tuple[int, str, str, str]]:
+    """Scan /proc once to build inode → (pid, comm, exe, cmdline) for socket fds.
 
     O(processes × fds) total instead of O(connections × processes × fds)
-    when looking up multiple inodes from the same snapshot.
+    when looking up multiple inodes from the same snapshot. exe/cmdline are
+    resolved only for processes that actually own sockets.
     """
-    inode_map: dict[str, tuple[int, str]] = {}
+    inode_map: dict[str, tuple[int, str, str, str]] = {}
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
             continue
         try:
-            comm_path = f"/proc/{pid}/comm"
-            fd_dir    = f"/proc/{pid}/fd"
-            with open(comm_path) as f:
-                name = f.read().strip()
+            fd_dir = f"/proc/{pid}/fd"
+            sock_inodes = []
             for fd in os.listdir(fd_dir):
                 try:
                     link = os.readlink(f"{fd_dir}/{fd}")
                     if link.startswith("socket:["):
-                        inode_map[link[8:-1]] = (int(pid), name)
+                        sock_inodes.append(link[8:-1])
                 except (PermissionError, FileNotFoundError):
                     pass
+            if not sock_inodes:
+                continue
+            with open(f"/proc/{pid}/comm") as f:
+                name = f.read().strip()
+            exe     = _readlink_exe(pid)
+            cmdline = _proc_cmdline(pid)
+            for inode in sock_inodes:
+                inode_map[inode] = (int(pid), name, exe, cmdline)
         except (PermissionError, FileNotFoundError):
             continue
     return inode_map
@@ -144,6 +179,7 @@ class ProcessNetworkMonitor:
                         local_addr=c["local"],
                         remote_addr=f"{c['remote_ip']}:{c['remote_port']}",
                         remote_ip=c["remote_ip"], remote_port=c["remote_port"],
+                        exe=c.get("exe", ""), cmdline=c.get("cmdline", ""),
                     )
                     for c in conns
                 ]
@@ -156,9 +192,11 @@ class ProcessNetworkMonitor:
             rip = _unwrap_mapped(entry["remote_ip"])
             if rip in ("0.0.0.0", "::", "::ffff:0.0.0.0"):
                 continue
+            if rip.startswith("127."):  # loopback — not an external connection
+                continue
             result = inode_map.get(entry["inode"])
             if result:
-                pid, name = result
+                pid, name, exe, cmdline = result
                 conns.append(Connection(
                     pid=pid,
                     process=name,
@@ -166,10 +204,48 @@ class ProcessNetworkMonitor:
                     remote_addr=f"{rip}:{entry['remote_port']}",
                     remote_ip=rip,
                     remote_port=entry["remote_port"],
+                    exe=exe,
+                    cmdline=cmdline,
                 ))
         return conns
 
-    _NORMAL_PORTS = {80, 443, 8080, 8443, 53, 22, 5353, 8888, 1194, 51820}
+    _NORMAL_PORTS = {
+        80, 443, 8080, 8443, 53, 22, 5353, 8888, 1194, 51820,
+        21, 25, 587, 465, 993, 995, 143, 110, 123, 389, 636, 853,
+        3000, 5000, 8000, 8081, 9090, 9418, 9092, 3478, 5349,
+        5222, 5269, 6697, 64738, 5060, 5061,
+    }
+
+    def _is_known(self, conn: Connection) -> bool:
+        """Whether ``conn`` belongs to a known/whitelisted process.
+
+        Matches known-process keys against three identity sources, so that
+        multi-process apps whose comm is renamed ("Socket Process", "electron",
+        "Isolated Web Co") are still recognised:
+          • comm            (conn.process)
+          • exe basename    (conn.exe, when the sandbox lets us read it)
+          • every path component of the cmdline — this is what catches an
+            Electron app by its install dir, e.g.
+            /usr/lib/bitwarden/app.asar → component "bitwarden".
+        Matching is case-insensitive; a key matches a candidate that equals it
+        or begins with "<key>-" / "<key>." (covers firefox-esr, chrome-sandbox,
+        chromium-browser) without over-matching unrelated names (wg vs wget).
+        """
+        candidates: set[str] = set()
+        if conn.process:
+            candidates.add(conn.process.lower())
+        if conn.exe:
+            candidates.add(conn.exe.lower())
+        for tok in (conn.cmdline or "").lower().split():
+            for part in tok.split("/"):
+                if part:
+                    candidates.add(part)
+        for k in self._known:
+            kl = k.lower()
+            for c in candidates:
+                if c == kl or c.startswith(kl + "-") or c.startswith(kl + "."):
+                    return True
+        return False
 
     async def _monitor(self) -> None:
         seen: set[tuple] = set()
@@ -179,7 +255,7 @@ class ProcessNetworkMonitor:
             for conn in conns:
                 if conn.remote_ip in self._whitelist:
                     continue
-                if self._known and conn.process not in self._known:
+                if self._known and not self._is_known(conn):
                     if conn.remote_port in self._NORMAL_PORTS:
                         continue
                     key = (conn.process, conn.remote_ip, conn.remote_port)
@@ -194,6 +270,7 @@ class ProcessNetworkMonitor:
                         data={"process": conn.process, "pid": conn.pid,
                               "remote": conn.remote_addr},
                     ))
-            # Prune seen set to prevent unbounded memory growth over long sessions
             if len(seen) > _SEEN_MAX:
+                items = list(seen)
                 seen.clear()
+                seen.update(items[-_SEEN_MAX // 2:])

@@ -50,8 +50,9 @@ def test_internet():
         return True
     else:
         print(f"  HTTP {code or 'no response'} — internet appears blocked")
-        print(f"  {WARN} Active nft rules:")
-        subprocess.run(["nft", "list", "ruleset", "-a"], capture_output=True, text=True)
+        print(f"  {WARN} Active firewall rules (check firewalld manually):")
+        # Direct firewall-cmd call removed — would trigger polkit prompt.
+        # Use `sudo firewall-cmd --list-all` from a terminal instead.
         return False
 
 

@@ -64,10 +64,28 @@ def _get_gateway_info(interface: str | None = None) -> tuple[str | None, str | N
 
 
 def _get_own_ips(interface: str) -> set[str]:
-    """Return all IPv4 addresses assigned to interface."""
+    """Return every IPv4 address on this HOST — not just ``interface``'s.
+
+    Callers use this as the "traffic we generated ourselves" filter, so scoping
+    it to one interface produced constant false positives:
+
+    * Starting a VM brings up libvirt/QEMU interfaces (virbr0 at 192.168.122.1,
+      vnet*/tap*). Those addresses are ours, but they were absent from the set,
+      so the guest and the bridge looked like unknown hosts appearing on the
+      network — an alert every time a VM booted.
+    * Running a local port sweep (nmap) emits SYNs whose source is this machine.
+      If they left via any interface other than the monitored one — or if the
+      monitored interface name was stale, in which case `ip addr show <iface>`
+      fails and this returned an EMPTY set, filtering nothing at all — our own
+      scan was reported as an incoming attack.
+
+    ``interface`` is kept in the signature for call-site compatibility; the
+    host-wide answer is strictly safer, since an address that is genuinely ours
+    must never be attributed to an attacker.
+    """
     try:
         out = subprocess.check_output(
-            ['ip', 'addr', 'show', interface], text=True, timeout=3)
+            ['ip', '-4', 'addr', 'show'], text=True, timeout=3)
         return set(_INET_RE.findall(out))
     except Exception:
         return set()
@@ -86,7 +104,9 @@ class ARPWatcher:
         self._gw_ip: str | None = None
         self._gw_mac: str | None = None
         self._gw_mac_pending: str | None = None
+        self._gw_ip_pending: str | None = None
         self._bus: EventBus | None = None
+        self._helper = None
         self._task: asyncio.Task | None = None
         self._gw_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -100,6 +120,7 @@ class ARPWatcher:
         self._gw_ip, self._gw_mac = await asyncio.to_thread(
             _get_gateway_info, self.interface)
 
+        self._helper = helper
         if helper and helper.is_connected():
             helper.on_event(self._on_helper_event)
         else:
@@ -109,6 +130,8 @@ class ARPWatcher:
 
     async def stop(self) -> None:
         self._stop_event.set()  # wake up scapy's stop_filter
+        if self._helper is not None:
+            self._helper.off_event(self._on_helper_event)
         for t in (self._task, self._gw_task):
             if t:
                 t.cancel()
@@ -120,7 +143,13 @@ class ARPWatcher:
     async def _on_helper_event(self, msg: dict) -> None:
         if msg.get("event") != "arp":
             return
-        ip, mac = msg["src"], msg["mac"]
+        ip, mac = msg.get("src", ""), msg.get("mac", "")
+        # The helper now forwards requests (op 1) as well as replies, since a
+        # who-has storm is how discovery looks. Both carry a usable sender
+        # identity, but 0.0.0.0 is an address-probe with no sender yet — it
+        # would otherwise register as a device at address zero.
+        if not ip or ip == "0.0.0.0" or not mac:
+            return
         if ip in self._whitelist or ip in self._own_ips:
             return
         # _evaluate may shell out to `ip neigh`; keep it off the event loop.
@@ -223,6 +252,10 @@ class ARPWatcher:
                     self._gw_ip, self._gw_mac = gw_ip, gw_mac
                     continue
                 if gw_ip != self._gw_ip:
+                    if getattr(self, "_gw_ip_pending", None) != gw_ip:
+                        self._gw_ip_pending = gw_ip
+                        continue
+                    self._gw_ip_pending = None
                     await self._bus.emit(Event(
                         type=EventType.ARP_SPOOF,
                         level=ThreatLevel.DANGEROUS,

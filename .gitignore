@@ -39,3 +39,6 @@ maze.log.*
 .env
 *.key
 *.pem
+
+# Local Arch package build output
+dist-pkg/

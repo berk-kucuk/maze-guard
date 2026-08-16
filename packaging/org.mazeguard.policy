@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+
+<!--
+  Maze Guard authorisation policy.
+
+  The privileged helper is reachable by every member of the `maze` group, which
+  in practice means every process running as the desktop user — including one
+  the user never knowingly started. Adding protection through that channel is
+  harmless and stays unauthenticated; taking protection away is what this action
+  gates. Malware can raise the prompt, but it cannot answer it.
+
+  allow_active uses auth_admin_keep so that a single confirmation covers an
+  operation made up of several privileged steps (clearing every block rule is
+  one user action but many rule removals). The cache is per-session and
+  short-lived, which is the same trade every polkit-driven settings panel makes.
+-->
+<policyconfig>
+  <vendor>Maze Guard</vendor>
+  <vendor_url>https://github.com/berk-kucuk/maze-guard</vendor_url>
+
+  <action id="org.mazeguard.disable-protection">
+    <description>Turn off a Maze Guard protection</description>
+    <description xml:lang="tr">Maze Guard korumasını kapat</description>
+    <message>Authentication is required to turn off a network protection: stopping the firewall, lowering the incoming-traffic shield, or removing a block on an attacker.</message>
+    <message xml:lang="tr">Bir ağ korumasını kapatmak için kimlik doğrulaması gerekiyor: güvenlik duvarını durdurmak, gelen trafik kalkanını indirmek veya bir saldırganın engelini kaldırmak.</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

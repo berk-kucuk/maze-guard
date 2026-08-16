@@ -2,11 +2,21 @@ import asyncio
 import socket
 import httpx
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
+from maze.utils.logger import log
 
+# JSON DoH endpoints, one per independent operator.
+#
+# These URLs are not interchangeable with the RFC 8484 wire-format ones, and
+# getting them wrong fails quietly: `/dns-query` on Google serves an HTML page
+# and Quad9 answers "unable to decode BASE64-URL", both of which blew up in
+# resp.json() and were swallowed as "resolver unreachable". With two of the
+# three silently out, the code never had the two agreeing answers it requires
+# and returned "looks fine" for every domain — DNS poisoning detection was
+# switched on in the interface and doing nothing at all.
 DOH_RESOLVERS = {
     "cloudflare": "https://cloudflare-dns.com/dns-query",
-    "google":     "https://dns.google/dns-query",
-    "quad9":      "https://dns.quad9.net/dns-query",
+    "google":     "https://dns.google/resolve",
+    "adguard":    "https://dns.adguard-dns.com/resolve",
 }
 
 # Canary domains chosen because they resolve to a small, globally-stable set of
@@ -60,7 +70,29 @@ class DNSValidator:
                 agreeing += 1
         # Need at least two independent DoH answers to trust the baseline.
         if agreeing < 2 or not trusted:
+            # Say so once. Silently returning "fine" here is how this detector
+            # spent its life reporting Active while validating nothing.
+            if "__baseline__" not in self._warned:
+                self._warned.add("__baseline__")
+                reasons = [str(r) for r in doh_results if isinstance(r, Exception)]
+                log.warning(
+                    f"DNSValidator: only {agreeing} of {len(DOH_RESOLVERS)} "
+                    f"DoH resolvers answered — cannot validate DNS until at "
+                    f"least two are reachable"
+                    + (f" ({reasons[0]})" if reasons else ""))
+                if self._bus:
+                    await self._bus.emit(Event(
+                        type=EventType.DNS_SPOOF,
+                        level=ThreatLevel.SUSPICIOUS,
+                        message="DNS validation unavailable: fewer than two "
+                                "trusted resolvers are reachable, so local DNS "
+                                "answers cannot be cross-checked",
+                        data={"agreeing": agreeing,
+                              "resolvers": list(DOH_RESOLVERS)},
+                    ))
             return True
+        # Recovered — allow the warning again if it breaks a second time.
+        self._warned.discard("__baseline__")
 
         local = await self._local_resolve(domain)
         if not local:

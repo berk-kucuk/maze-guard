@@ -53,6 +53,11 @@ def run() -> None:
     app.setApplicationName("Maze Guard")
     app.setApplicationDisplayName("Maze Guard")
     app.setOrganizationName("maze")
+    # Tie the window to the installed maze-guard.desktop entry. This sets the
+    # X11 WM_CLASS / Wayland app_id to "maze-guard" so the running window is
+    # grouped under the app's own icon (matching StartupWMClass in the .desktop
+    # file) instead of showing up in the dock as a generic "python3" window.
+    app.setDesktopFileName("maze-guard")
     app.setWindowIcon(create_app_icon(64))
 
     # Keep the event loop alive when the main window is hidden to the tray.

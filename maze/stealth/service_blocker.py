@@ -1,25 +1,14 @@
 import asyncio
-import subprocess
 from maze.utils.logger import log
-
-# Imported lazily to avoid circular import at module load time
-_INIT_RULESET: str | None = None
-
-
-def _load_ruleset() -> str:
-    global _INIT_RULESET
-    if _INIT_RULESET is None:
-        from maze.protection.firewall import _INIT_RULESET as rs
-        _INIT_RULESET = rs
-    return _INIT_RULESET
 
 
 class ServiceBlocker:
-    """Block mDNS/NetBIOS broadcast leaks through the Maze firewall table.
+    """Block mDNS/NetBIOS broadcast leaks via firewalld rich rules.
 
-    Runs its nftables changes through the privileged helper when available
-    (daemon mode, GUI is unprivileged); otherwise it edits nftables directly,
-    which only works when the process itself is root.
+    Rules are added through the privileged helper daemon (running as root
+    via systemd) so the GUI never prompts for a password. If the helper
+    isn't connected, operations silently fail — they never fall back to
+    a direct subprocess call that would trigger a polkit prompt.
     """
 
     _PORTS = [("udp", 5353), ("udp", 137), ("udp", 138)]
@@ -29,53 +18,24 @@ class ServiceBlocker:
         self._helper = None
 
     async def start(self, bus, helper=None) -> None:
-        import os
         self._helper = helper
-        if not (helper and helper.is_connected()) and os.getuid() != 0:
-            raise PermissionError(
-                "ServiceBlocker needs the privileged helper (or root) to edit nftables")
-        await self._ensure_ruleset()
         for proto, port in self._PORTS:
-            ok = await self._nft([
-                "nft", "add", "element", "inet", "maze_firewall",
-                f"blocked_ports_{proto}", "{", str(port), "}",
-            ])
+            rule = f'rule family=ipv4 port port={port} protocol={proto} drop'
+            ok = await self._fw(["--permanent", "--add-rich-rule", rule])
             if not ok:
                 log.warning(f"ServiceBlocker: could not block {proto}/{port}")
+        await self._fw(["--reload"])
         self._active = True
 
     async def stop(self) -> None:
         for proto, port in self._PORTS:
-            await self._nft([
-                "nft", "delete", "element", "inet", "maze_firewall",
-                f"blocked_ports_{proto}", "{", str(port), "}",
-            ])
+            rule = f'rule family=ipv4 port port={port} protocol={proto} drop'
+            await self._fw(["--permanent", "--remove-rich-rule", rule])
+        await self._fw(["--reload"])
         self._active = False
 
-    # ── helper / direct plumbing ──────────────────────────────────────────
-
-    async def _ensure_ruleset(self) -> None:
-        """Create the maze_firewall table if it doesn't exist yet."""
+    async def _fw(self, args: list[str]) -> bool:
+        cmd = ["firewall-cmd"] + args
         if self._helper and self._helper.is_connected():
-            # nft_apply is idempotent for our additive ruleset.
-            await self._helper.nft_apply(_load_ruleset())
-        else:
-            await asyncio.to_thread(self._ensure_ruleset_direct)
-
-    async def _nft(self, args: list[str]) -> bool:
-        if self._helper and self._helper.is_connected():
-            return await self._helper.fw_cmd(args)
-        return await asyncio.to_thread(self._nft_direct, args)
-
-    @staticmethod
-    def _ensure_ruleset_direct() -> None:
-        r = subprocess.run(["nft", "list", "table", "inet", "maze_firewall"],
-                           capture_output=True)
-        if r.returncode != 0:
-            subprocess.run(["nft", "-f", "-"], input=_load_ruleset(),
-                           text=True, capture_output=True)
-
-    @staticmethod
-    def _nft_direct(args: list[str]) -> bool:
-        r = subprocess.run(args, capture_output=True, text=True, check=False)
-        return r.returncode == 0
+            return await self._helper.fw_cmd(cmd)
+        return False  # no helper, no direct call — would trigger polkit

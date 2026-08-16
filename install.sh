@@ -93,6 +93,7 @@ do_uninstall() {
   if $NEED_ROOT && command -v systemctl &>/dev/null; then
     systemctl disable --now maze-guard.service 2>/dev/null || true
     [[ -f "$SERVICE_FILE" ]] && { rm -f "$SERVICE_FILE"; systemctl daemon-reload; info "Removed maze-guard.service"; }
+    rm -f /usr/share/polkit-1/actions/org.mazeguard.policy
     rm -rf /run/maze
   fi
 
@@ -152,7 +153,7 @@ install_system_deps() {
   if distro_is "arch|manjaro|endeavouros|garuda|artix|cachyos"; then
     pacman -Sy --needed --noconfirm \
       python python-pip \
-      nftables iproute2 \
+      firewalld iproute2 \
       wireless_tools \
       python-dbus dbus \
       gcc pkg-config \
@@ -163,7 +164,7 @@ install_system_deps() {
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
       python3 python3-pip python3-venv python3-dev \
-      nftables iproute2 \
+      firewalld iproute2 \
       wireless-tools \
       libdbus-1-dev dbus pkg-config \
       gcc build-essential \
@@ -176,7 +177,7 @@ install_system_deps() {
   elif distro_is "fedora"; then
     dnf install -y \
       python3 python3-pip python3-devel \
-      nftables iproute \
+      firewalld iproute \
       wireless-tools \
       dbus-devel dbus-glib-devel \
       gcc pkg-config \
@@ -188,7 +189,7 @@ install_system_deps() {
     dnf install -y epel-release 2>/dev/null || true
     dnf install -y \
       python3 python3-pip python3-devel \
-      nftables iproute \
+      firewalld iproute \
       dbus-devel gcc pkg-config \
       mesa-libGL \
       || warn "Some packages may have failed — continuing"
@@ -196,7 +197,7 @@ install_system_deps() {
   elif distro_is "opensuse|suse"; then
     zypper --non-interactive install \
       python3 python3-pip python3-devel \
-      nftables iproute2 \
+      firewalld iproute2 \
       wireless-tools \
       dbus-1-devel python3-dbus-python \
       gcc pkg-config libGL1 \
@@ -204,7 +205,7 @@ install_system_deps() {
 
   else
     warn "Unknown distro '${DISTRO_ID}' — skipping package manager step."
-    warn "Manually install: python3 (≥3.11), nftables, iproute2, dbus-devel, libxcb"
+    warn "Manually install: python3 (≥3.11), firewalld, iproute2, dbus-devel, libxcb"
   fi
 
   ok "System dependencies done"
@@ -352,7 +353,7 @@ Version=1.1
 Type=Application
 Name=Maze Guard
 GenericName=Network Security Monitor
-Comment=Public WiFi protection — MITM detection, MAC randomization, firewall
+Comment=Public WiFi protection — MITM detection, firewall
 Exec=$LAUNCHER
 Icon=maze-guard
 Terminal=false
@@ -442,7 +443,21 @@ setup_daemon() {
     ok "Added '$CURRENT_USER' to group '$MAZE_GROUP'"
   fi
 
-  # 2. systemd unit
+  # 2. polkit action — consent for turning protections off
+  # The helper refuses destructive requests outright when this is missing, so
+  # it is installed alongside the daemon rather than treated as optional.
+  local POLICY_SRC="$SRC_DIR/packaging/org.mazeguard.policy"
+  local POLICY_DST="/usr/share/polkit-1/actions/org.mazeguard.policy"
+  if [[ -f "$POLICY_SRC" ]]; then
+    install -Dm644 "$POLICY_SRC" "$POLICY_DST"
+    ok "polkit action: $POLICY_DST"
+    command -v pkcheck &>/dev/null \
+      || warn "polkit is not installed — turning protections off from the GUI will be refused"
+  else
+    warn "packaging/org.mazeguard.policy not found — the GUI will not be able to disable protections"
+  fi
+
+  # 3. systemd unit
   cat > "$SERVICE_FILE" << SERVICE_EOF
 [Unit]
 Description=Maze Guard privileged helper
@@ -453,20 +468,36 @@ Type=simple
 ExecStart=$VENV_PY_ABS $HELPER_ABS
 Restart=on-failure
 RestartSec=2
-RuntimeDirectory=maze
-RuntimeDirectoryMode=0750
+# NO RuntimeDirectory=maze: /run/maze is shared with maze-tools' maze-guardd
+# (guard.sock) and Maze Sentinel. RuntimeDirectory would make systemd delete
+# the whole directory whenever this unit stops, destroying their files. The
+# helper creates and permissions the directory itself in _ensure_sock_dir().
+# Hardening. Deliberately conservative: firewalld needs to write /etc/firewalld
+# (so ProtectSystem stays at 'true', not 'strict'), the helper writes sysctl and
+# uses AF_PACKET for sniffing, so kernel-tunable/address-family locks are omitted.
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelLogs=true
+ProtectSystem=true
+ProtectHostname=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
 SERVICE_EOF
   ok "Service unit: $SERVICE_FILE"
 
-  # 3. enable + start
+  # 4. enable + start
   systemctl daemon-reload
-  systemctl enable --now maze-guard.service 2>/dev/null || true
+  systemctl enable maze-guard.service 2>/dev/null || true
+  # Restart rather than start: on an upgrade the unit is already active, and
+  # `enable --now` is a no-op for a running service — the daemon would keep
+  # executing the *previous* helper.py while the GUI ran the new one, so any
+  # newly added helper command silently failed.
+  systemctl restart maze-guard.service 2>/dev/null || \
+    systemctl start maze-guard.service 2>/dev/null || true
   sleep 1
   if systemctl is-active --quiet maze-guard.service; then
     ok "maze-guard.service is running"

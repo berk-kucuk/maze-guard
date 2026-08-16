@@ -6,12 +6,12 @@ class Profile(Enum):
     HOME = "home"
     PUBLIC = "public"
     PARANOID = "paranoid"
+    SECURE = "secure"
     MANUAL = "manual"
 
 
 @dataclass
 class ProfileConfig:
-    mac_randomize: bool
     hide_hostname: bool
     block_incoming: bool
     doh_enabled: bool
@@ -22,11 +22,10 @@ class ProfileConfig:
 
 
 PROFILES: dict[Profile, ProfileConfig] = {
-    # Trusted home network: passive detection only, no system changes.
+    # Trusted home network: detection active, firewall always on.
     Profile.HOME: ProfileConfig(
-        mac_randomize=False,
         hide_hostname=False,
-        block_incoming=False,
+        block_incoming=True,
         doh_enabled=True,
         port_scan_detect=True,
         process_monitor=True,
@@ -35,7 +34,6 @@ PROFILES: dict[Profile, ProfileConfig] = {
     ),
     # Untrusted public WiFi: hide identity, block unsolicited inbound.
     Profile.PUBLIC: ProfileConfig(
-        mac_randomize=True,
         hide_hostname=True,
         block_incoming=True,
         doh_enabled=True,
@@ -46,7 +44,16 @@ PROFILES: dict[Profile, ProfileConfig] = {
     ),
     # Maximum stealth: everything Public does, plus mDNS/NetBIOS service blocking.
     Profile.PARANOID: ProfileConfig(
-        mac_randomize=True,
+        hide_hostname=True,
+        block_incoming=True,
+        doh_enabled=True,
+        port_scan_detect=True,
+        process_monitor=True,
+        fingerprint_protect=True,
+        block_services=True,
+    ),
+    # Maximum security: all protections active, fingerprint, service blocking.
+    Profile.SECURE: ProfileConfig(
         hide_hostname=True,
         block_incoming=True,
         doh_enabled=True,
@@ -57,7 +64,6 @@ PROFILES: dict[Profile, ProfileConfig] = {
     ),
     # Manual: nothing auto-applied — the user toggles modules by hand.
     Profile.MANUAL: ProfileConfig(
-        mac_randomize=False,
         hide_hostname=False,
         block_incoming=False,
         doh_enabled=False,

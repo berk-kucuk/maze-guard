@@ -3,6 +3,7 @@ import re
 import socket
 import struct
 import subprocess
+import time
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.utils.logger import log
 
@@ -67,18 +68,84 @@ def _get_resolved_upstreams() -> set[str]:
             ["resolvectl", "dns"], text=True, timeout=2,
             stderr=subprocess.DEVNULL,
         )
+        for ip in _IPV4_RE.findall(out):
+            if all(0 <= int(o) <= 255 for o in ip.split(".")):
+                servers.add(ip)
+    except Exception:
+        pass
+    return servers
+
+
+def _get_resolved_fallback() -> set[str]:
+    """DNS servers systemd-resolved may legitimately use beyond the per-link
+    upstreams: the global 'Current DNS Server' and the built-in 'Fallback DNS
+    Servers' (IPv4 only).
+
+    When no per-link/global DNS is configured (e.g. DHCP handed over none),
+    resolved falls back to its compiled-in public resolvers — by default
+    Quad9 (9.9.9.9), Cloudflare (1.1.1.1) and Google (8.8.8.8). Those queries
+    genuinely egress to those IPs and are NOT a hijack, so they must count as
+    expected. 'resolvectl dns' never lists them, only 'resolvectl status' does.
+    """
+    servers: set[str] = set()
+    try:
+        out = subprocess.check_output(
+            ["resolvectl", "status", "--no-pager"], text=True, timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
     except Exception:
         return servers
+    # Both the 'Fallback DNS Servers:' block (with indented continuation lines)
+    # and the 'Current DNS Server:' line hold legitimate resolvers. No other
+    # IPv4 addresses appear in this output, so extracting them all is safe.
     for ip in _IPV4_RE.findall(out):
-        # Guard against octets > 255 that the loose regex can match.
         if all(0 <= int(o) <= 255 for o in ip.split(".")):
             servers.add(ip)
+    return servers
+
+
+def _get_nm_dns_servers() -> set[str]:
+    """DNS servers reported by NetworkManager (IPv4 only).
+
+    Covers setups where resolvectl has no per-link DNS because NetworkManager
+    manages DNS internally (e.g. dns=default in NetworkManager.conf).
+    """
+    servers: set[str] = set()
+    try:
+        out = subprocess.check_output(
+            ["nmcli", "--terse", "--fields", "IP4.DNS", "dev", "show"],
+            text=True, timeout=2, stderr=subprocess.DEVNULL,
+        )
+        for ip in _IPV4_RE.findall(out):
+            if all(0 <= int(o) <= 255 for o in ip.split(".")):
+                servers.add(ip)
+    except Exception:
+        pass
     return servers
 
 
 def _get_active_vpn_interfaces() -> list[str]:
     from maze.utils.network_info import get_active_vpn_interfaces
     return get_active_vpn_interfaces()
+
+
+def _dns_egress_iface(ip: str) -> str | None:
+    """Interface a packet to ``ip`` would actually leave through.
+
+    /proc/net/udp exposes the DNS *destination* but not the egress path. The
+    routing table does: under a full-tunnel VPN, even public resolvers such as
+    9.9.9.9 route out via tun0, so they are NOT leaks. Returns None when the
+    egress interface can't be determined.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ip", "route", "get", ip], text=True, timeout=2,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        return None
+    m = re.search(r'\bdev\s+(\S+)', out)
+    return m.group(1) if m else None
 
 
 def _read_udp_dns_destinations() -> list[str]:
@@ -119,9 +186,10 @@ class DNSLeakPreventer:
     /etc/resolv.conf (possible DNS hijack). Private IPs are never flagged
     without VPN since the home router DNS is normal.
 
-    With VPN active: DNS must go only to VPN-assigned servers (listed in
-    /etc/resolv.conf after VPN connects). Anything else — including the ISP
-    router at 192.168.x.x — is a leak through the VPN tunnel.
+    With VPN active: a DNS query is only a leak if it actually egresses via a
+    non-VPN interface (checked against the routing table). Queries that route
+    through the tunnel — including ones to public resolvers like 9.9.9.9 — are
+    legitimate under a full-tunnel VPN and are not flagged.
 
     VPN state changes reset the warned-IPs set so a reconnect can surface
     new leaks that weren't present in the previous session.
@@ -130,7 +198,7 @@ class DNSLeakPreventer:
     def __init__(self):
         self._task: asyncio.Task | None = None
         self._bus = None
-        self._warned: set[str] = set()
+        self._warned: dict[str, float] = {}  # ip -> timestamp
         self._last_vpn_state: frozenset[str] = frozenset()
 
     async def start(self, bus) -> None:
@@ -147,8 +215,9 @@ class DNSLeakPreventer:
             try:
                 leaks = await asyncio.to_thread(self._find_leaks)
                 for ip, msg in leaks:
-                    if ip not in self._warned:
-                        self._warned.add(ip)
+                    now = time.monotonic()
+                    if ip not in self._warned or now - self._warned[ip] > 1800:
+                        self._warned[ip] = now
                         await self._bus.emit(Event(
                             type=EventType.DNS_LEAK,
                             level=ThreatLevel.SUSPICIOUS,
@@ -165,7 +234,11 @@ class DNSLeakPreventer:
             return leaks
 
         configured = _get_configured_dns_servers()
-        resolved_upstreams = _get_resolved_upstreams()
+        resolved_upstreams = (
+            _get_resolved_upstreams()
+            | _get_resolved_fallback()
+            | _get_nm_dns_servers()
+        )
         vpn_ifaces = _get_active_vpn_interfaces()
         vpn_state = frozenset(vpn_ifaces)
 
@@ -176,25 +249,24 @@ class DNSLeakPreventer:
             self._last_vpn_state = vpn_state
 
         vpn_active = bool(vpn_ifaces)
-
-        # If VPN is active but resolv.conf couldn't be read or is empty,
-        # we have no baseline to compare against — skip rather than flood.
-        if vpn_active and not configured:
-            log.warning("DNSLeakPreventer: VPN active but resolv.conf has no "
-                        "nameservers — skipping leak check")
-            return leaks
+        vpn_set = set(vpn_ifaces)
 
         for ip in destinations:
             if ip in configured:
                 continue  # goes to expected resolver
 
             if vpn_active:
-                # VPN on: DNS must stay within VPN-assigned servers.
-                # Traffic to ISP router DNS (192.168.x.x) is a leak.
+                # A DNS query is a leak only if it actually leaves via a
+                # non-VPN interface. The destination alone doesn't tell us that
+                # — a full-tunnel VPN routes even public resolvers (9.9.9.9,
+                # 1.1.1.1) out through the tunnel, which is fine. Consult the
+                # routing table for the real egress path.
+                egress = _dns_egress_iface(ip)
+                if egress is None or egress in vpn_set:
+                    continue  # routed through the tunnel (or unknown) → not a leak
                 msg = (
-                    f"DNS leak detected: query to {ip} bypasses VPN "
-                    f"({', '.join(vpn_ifaces)}) — expected: "
-                    f"{', '.join(sorted(configured))}"
+                    f"DNS leak detected: query to {ip} egresses via '{egress}' "
+                    f"instead of the VPN tunnel ({', '.join(vpn_ifaces)})"
                 )
                 leaks.append((ip, msg))
             else:

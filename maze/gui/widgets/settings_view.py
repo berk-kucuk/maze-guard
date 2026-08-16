@@ -5,12 +5,15 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGroupBox, QLabel, QCheckBox,
     QSpinBox, QTableWidget, QTableWidgetItem, QHeaderView,
-    QPushButton, QLineEdit, QScrollArea, QFrame, QSizePolicy,
+    QPushButton, QLineEdit, QScrollArea, QFrame, QSizePolicy, QComboBox,
 )
 from PyQt6.QtCore import Qt
 import re
 
 _AUTOSTART_PATH = Path.home() / ".config" / "autostart" / "maze.desktop"
+# A system-wide install (install.sh) drops this one; the settings checkbox must
+# reflect it too, otherwise it shows "off" while the app still autostarts.
+_SYS_AUTOSTART_PATH = Path("/etc/xdg/autostart/maze-guard.desktop")
 _AUTOSTART_TEMPLATE = """\
 [Desktop Entry]
 Type=Application
@@ -81,32 +84,59 @@ class SettingsView(QWidget):
         row1.addStretch()
         layout.addLayout(row1)
 
-        # MAC rotation
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("MAC rotation interval (minutes):"))
-        self._mac_spin = QSpinBox()
-        self._mac_spin.setRange(5, 1440)
-        self._mac_spin.setValue(self._cfg.mac_rotation_minutes)
-        self._mac_spin.setFixedWidth(90)
-        self._mac_spin.valueChanged.connect(self._on_mac_rotation_change)
-        row2.addWidget(self._mac_spin)
-        row2.addStretch()
-        layout.addLayout(row2)
+        # Desktop notification threshold. Events always reach the dashboard list;
+        # this only decides which of them are allowed to pop up a tray message.
+        row3 = QHBoxLayout()
+        row3.addWidget(QLabel("Desktop notifications:"))
+        self._notify_combo = QComboBox()
+        for label, value in self._NOTIFY_CHOICES:
+            self._notify_combo.addItem(label, value)
+        current = str(getattr(self._cfg, "notify_min_level", "dangerous")).lower()
+        idx = self._notify_combo.findData(current)
+        self._notify_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._notify_combo.setFixedWidth(220)
+        self._notify_combo.currentIndexChanged.connect(self._on_notify_level_change)
+        row3.addWidget(self._notify_combo)
+        row3.addStretch()
+        layout.addLayout(row3)
+
+        # Automatic blocking. Only ever applies to a confirmed active attack
+        # (port scan, stealth scan, correlated multi-stage) from an on-link
+        # private address, and never to gateway/DNS infrastructure — but it is
+        # still the app acting on its own, so it is switchable.
+        self._auto_block_cb = QCheckBox(
+            "Automatically block confirmed attackers")
+        self._auto_block_cb.setChecked(bool(getattr(self._cfg, "auto_block", True)))
+        self._auto_block_cb.setToolTip(
+            "When a source is caught scanning this host, add a firewall drop "
+            "rule for it after reconnaissance.\n"
+            "Gateway, DNS and whitelisted addresses are never blocked, and "
+            "public (spoofable) sources are ignored.")
+        self._auto_block_cb.toggled.connect(self._on_auto_block_toggle)
+        layout.addWidget(self._auto_block_cb)
 
         return grp
+
+    def _on_auto_block_toggle(self, enabled: bool) -> None:
+        self._cfg.auto_block = enabled
+        self._save_cb()
+
+    # (label, stored value) — order matters: index 0 is the fallback.
+    _NOTIFY_CHOICES = (
+        ("Dangerous only (recommended)", "dangerous"),
+        ("Dangerous + suspicious", "suspicious"),
+        ("Off — dashboard only", "off"),
+    )
+
+    def _on_notify_level_change(self, _idx: int) -> None:
+        self._cfg.notify_min_level = self._notify_combo.currentData()
+        self._save_cb()
 
     def _on_threshold_change(self, val: int) -> None:
         self._cfg.port_scan_threshold = val
         scanner = self._engine._modules.get("port_scan")
         if scanner:
             scanner.threshold = val
-        self._save_cb()
-
-    def _on_mac_rotation_change(self, val: int) -> None:
-        self._cfg.mac_rotation_minutes = val
-        mac_mod = self._engine._modules.get("mac")
-        if mac_mod:
-            mac_mod.rotation_seconds = val * 60
         self._save_cb()
 
     # ── Auto profile ───────────────────────────────────────────────────────
@@ -320,13 +350,13 @@ class SettingsView(QWidget):
         layout.setSpacing(10)
 
         self._autostart_cb = QCheckBox("Launch Maze Guard automatically on login (hidden in tray)")
-        self._autostart_cb.setChecked(_AUTOSTART_PATH.exists())
+        self._autostart_cb.setChecked(_AUTOSTART_PATH.exists() or _SYS_AUTOSTART_PATH.exists())
         self._autostart_cb.toggled.connect(self._toggle_autostart)
         layout.addWidget(self._autostart_cb)
 
-        note = QLabel(f"Writes to {_AUTOSTART_PATH}")
-        note.setStyleSheet("font-size: 11px; color: #888;")
-        layout.addWidget(note)
+        self._autostart_note = QLabel(f"Writes to {_AUTOSTART_PATH}")
+        self._autostart_note.setStyleSheet("font-size: 11px; color: #888;")
+        layout.addWidget(self._autostart_note)
 
         return grp
 
@@ -343,5 +373,14 @@ class SettingsView(QWidget):
                     script=script,
                 )
             )
+            self._autostart_note.setText(f"Writes to {_AUTOSTART_PATH}")
         else:
             _AUTOSTART_PATH.unlink(missing_ok=True)
+            # A system-wide autostart entry can only be removed with root; warn
+            # rather than silently leaving the app to keep launching on login.
+            if _SYS_AUTOSTART_PATH.exists():
+                self._autostart_note.setText(
+                    f"System-wide autostart still active at {_SYS_AUTOSTART_PATH} "
+                    f"— remove it with: sudo rm {_SYS_AUTOSTART_PATH}"
+                )
+                self._autostart_note.setStyleSheet("font-size: 11px; color: #e0a050;")

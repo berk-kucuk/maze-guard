@@ -4,7 +4,7 @@ Maze Guard module integration test — run with sudo:
 
 Tests every detection/protection/stealth module by starting it for a short
 duration and verifying it produces events on the bus. Root is required for
-nftables, MAC changes, and raw socket sniffing.
+firewalld, MAC changes, and raw socket sniffing.
 """
 import asyncio
 import os
@@ -60,7 +60,6 @@ async def test_imports():
         "maze.detection.dns_validator",
         "maze.detection.tls_monitor",
         "maze.detection.ssl_strip",
-        "maze.stealth.mac_changer",
         "maze.stealth.hostname_hide",
         "maze.stealth.service_blocker",
         "maze.stealth.fingerprint",
@@ -187,7 +186,7 @@ async def test_tls_monitor():
     m = TLSMonitor()
     try:
         h = await asyncio.wait_for(
-            asyncio.to_thread(m._get_cert_hash, "github.com", 443), timeout=8)
+            asyncio.to_thread(m._get_spki_hash, "github.com", 443), timeout=8)
         if h:
             ok(f"github.com TLS cert hash: {h[:16]}…")
         else:
@@ -203,9 +202,48 @@ async def test_port_scanner(engine):
     ps = engine._modules.get("port_scan")
     if ps:
         ok(f"PortScanDetector running  threshold={ps.threshold}")
-        ok(f"Reset task present: {ps._reset_task is not None}")
+        ok(f"Window prune task present: {ps._prune_task is not None}")
     else:
         fail("PortScanDetector not in engine modules")
+
+
+async def test_anomaly(engine):
+    section("8b. AnomalyDetector — correlation engine")
+    an = engine._modules.get("anomaly")
+    if not an:
+        fail("AnomalyDetector not in engine modules")
+        return
+    ok(f"AnomalyDetector running  gateway={an._gw_ip or '—'}")
+
+    from maze.core.events import Event, EventType, ThreatLevel
+    seen = []
+
+    async def sink(ev):
+        if ev.type == EventType.ATTACK_CHAIN:
+            seen.append(ev)
+
+    engine.bus.subscribe_all(sink)
+    for etype in (EventType.PORT_SCAN, EventType.ARP_SPOOF):
+        await engine.bus.emit(Event(type=etype, level=ThreatLevel.DANGEROUS,
+                                    message="synthetic test event",
+                                    data={"src": "203.0.113.253"}))
+    engine.bus.unsubscribe_all(sink)
+    if seen:
+        ok(f"Correlated: {seen[0].message}")
+    else:
+        fail("two techniques from one source did not correlate")
+
+
+async def test_incidents(engine):
+    section("8c. IncidentStore — attacker dossier")
+    att = engine.incidents.get("203.0.113.253")
+    if not att:
+        fail("synthetic attacker was not filed")
+        return
+    ok(f"Dossier: score={att.score()} severity={att.severity} "
+       f"techniques={sorted(att.techniques)}")
+    ok(f"Evidence journal: {engine.incidents.journal_path}")
+    engine.incidents.clear("203.0.113.253")
 
 
 async def test_process_monitor(engine):
@@ -250,19 +288,18 @@ async def test_dns_leak():
 
 
 async def test_firewall():
-    section("11. FirewallManager — nftables init")
+    section("11. FirewallManager — firewalld init")
     from maze.protection.firewall import FirewallManager
     fw = FirewallManager()
     try:
         ok_init = await asyncio.wait_for(fw.ensure_init(), timeout=5)
         if ok_init:
-            ok("maze_firewall table created/verified")
+            ok("firewalld zone detected")
             rules = await fw.list_rules()
             ok(f"Current rules: {rules}")
-            await fw.flush()
-            ok("Firewall flushed (clean state)")
+            ok("Firewall ready (firewalld)")
         else:
-            fail("ensure_init() returned False — nft error or no root?")
+            warn("ensure_init() returned False — firewalld not running or no permission?")
     except asyncio.TimeoutError:
         warn("Firewall init timed out")
     except Exception as e:
@@ -286,21 +323,6 @@ async def test_recon():
         warn("Recon timed out")
     except Exception as e:
         fail(f"Recon error: {e}")
-
-
-async def test_mac_changer(engine):
-    section("13. MACChanger — VPN guard check (no actual MAC change)")
-    from maze.utils.network_info import get_active_vpn_interfaces
-    vpns = await asyncio.to_thread(get_active_vpn_interfaces)
-    mc = engine._modules.get("mac")
-    if mc:
-        ok(f"MACChanger present  interface={mc.interface}")
-        if vpns:
-            ok(f"VPN active → MAC rotation will be skipped (correct)")
-        else:
-            ok("No VPN → MAC rotation allowed")
-    else:
-        warn("MACChanger not in active modules (expected — profile-controlled)")
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -330,11 +352,12 @@ async def main():
     await test_dns_validator()
     await test_tls_monitor()
     await test_port_scanner(engine)
+    await test_anomaly(engine)
+    await test_incidents(engine)
     await test_process_monitor(engine)
     await test_dns_leak()
     await test_firewall()
     await test_recon()
-    await test_mac_changer(engine)
 
     section("Summary")
     if engine:

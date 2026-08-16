@@ -72,12 +72,22 @@ ExecStart=${PYTHON} ${HELPER}
 Restart=on-failure
 RestartSec=2
 # systemd creates/cleans /run/maze for us; the helper re-groups it to 'maze'.
-RuntimeDirectory=maze
-RuntimeDirectoryMode=0750
-# Light hardening that does not interfere with nft / ip / sysctl.
+# NO RuntimeDirectory=maze: /run/maze is shared with maze-tools' maze-guardd
+# (guard.sock) and Maze Sentinel. RuntimeDirectory would make systemd delete
+# the whole directory whenever this unit stops, destroying their files. The
+# helper creates and permissions the directory itself in _ensure_sock_dir().
+# Light hardening that does not interfere with firewalld / ip / sysctl / scapy.
+# ProtectSystem stays 'true' (not 'strict') so firewalld can write /etc/firewalld;
+# kernel-tunable and address-family locks are omitted (helper writes sysctl and
+# sniffs via AF_PACKET).
 ProtectHome=true
 ProtectControlGroups=true
 ProtectKernelLogs=true
+ProtectSystem=true
+ProtectHostname=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target

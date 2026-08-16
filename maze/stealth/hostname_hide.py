@@ -2,7 +2,10 @@ import asyncio
 import subprocess
 from pathlib import Path
 
-_STATE_FILE = Path("/tmp/maze-hostname-state")
+# Kept in the user's own config dir rather than a world-writable, predictable
+# /tmp path — the latter lets another local user pre-create/symlink the file and
+# poison the avahi restore state on a multi-user host.
+_STATE_FILE = Path.home() / ".config" / "maze" / "hostname-state"
 _UNIT = "avahi-daemon"
 
 
@@ -25,6 +28,7 @@ class HostnameHider:
         self._mdns_was_running = await self._is_active()
         # Persist state so crash recovery can restart avahi even if this
         # object never sees its stop() call.
+        _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         _STATE_FILE.write_text("1" if self._mdns_was_running else "0")
         if self._mdns_was_running:
             await self._svc("stop")

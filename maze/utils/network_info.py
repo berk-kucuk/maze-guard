@@ -208,36 +208,53 @@ def get_open_ports() -> list[PortInfo]:
 
 
 def parse_firewall_output(raw: str) -> FirewallStatus:
-    """Parse raw `nft list ruleset` output into a FirewallStatus."""
+    """Parse raw `firewall-cmd --list-all` output into a FirewallStatus.
+
+    The first line of the output is e.g. "public (default, active)" — the
+    zone name plus its tags. We use it to set BOTH `active` (keyword match)
+    AND `maze_profile` (zone name), so the dashboard can report which zone
+    firewalld is currently using.
+    """
     if not raw.strip():
         return FirewallStatus()
-    profile = ""
-    if "maze_paranoid" in raw:
-        profile = "Paranoid"
-    elif "maze_public" in raw:
-        profile = "Public WiFi"
-    rule_lines = [
-        ln.strip() for ln in raw.splitlines()
-        if ln.strip() and not ln.strip().startswith("#")
-        and any(kw in ln for kw in ("accept", "drop", "reject", "masquerade"))
-    ]
-    return FirewallStatus(active=True, maze_profile=profile,
+    active = False
+    zone = ""
+    rule_lines: list[str] = []
+    try:
+        in_rich = False
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                in_rich = False
+                continue
+            if "(" in stripped and "active" in stripped.lower():
+                # Format: "public (default, active)"
+                active = True
+                zone = stripped.split(" ", 1)[0]
+            elif "running" in stripped.lower():
+                active = True
+            if stripped.startswith("rich rules:"):
+                in_rich = True
+                continue
+            if stripped.startswith("services:") or stripped.startswith("ports:") or \
+               stripped.startswith("masquerade:") or stripped.startswith("icmp-blocks:"):
+                in_rich = False
+                continue
+            if in_rich and stripped:
+                rule_lines.append(stripped)
+    except Exception:
+        pass
+    profile = zone if active and zone else ""
+    return FirewallStatus(active=active, maze_profile=profile,
                           rule_lines=rule_lines, rules_raw=raw)
 
 
 def get_firewall_status() -> FirewallStatus:
-    try:
-        result = subprocess.run(
-            ["nft", "list", "ruleset"],
-            text=True, timeout=3, capture_output=True,
-        )
-        if "not permitted" in result.stderr or "permission" in result.stderr.lower():
-            return FirewallStatus(active=False, maze_profile="(needs root)", rules_raw="")
-        raw = result.stdout
-    except FileNotFoundError:
-        return FirewallStatus(active=False, maze_profile="(nft not found)", rules_raw="")
-    except Exception:
-        return FirewallStatus()
+    """Return firewall status WITHOUT calling firewall-cmd directly.
 
-    return parse_firewall_output(raw
-    )
+    Reading firewall state requires auth; this function is the FALLBACK path
+    used when the privileged helper daemon is not connected. In that case we
+    return inactive rather than triggering a polkit password prompt.
+    The dashboard uses its own helper path (fw_list_all) when available.
+    """
+    return FirewallStatus(active=False, maze_profile="(needs root)", rules_raw="")

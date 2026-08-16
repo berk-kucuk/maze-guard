@@ -27,6 +27,7 @@ _PROFILES = [
     (Profile.HOME,     "profile_home"),
     (Profile.PUBLIC,   "profile_public"),
     (Profile.PARANOID, "profile_paranoid"),
+    (Profile.SECURE,   "profile_secure"),
     (Profile.MANUAL,   "profile_manual"),
 ]
 
@@ -198,6 +199,9 @@ class Dashboard(QMainWindow):
         self.module_status = ModuleStatusWidget(self.state, self.engine)
         self.firewall_view = FirewallView(self.state, self.engine)
 
+        from maze.gui.widgets.threats_view import ThreatsView
+        self.threats_view = ThreatsView(self.state, self.engine)
+
         from maze.gui.widgets.settings_view import SettingsView
         self.settings_view = SettingsView(
             self.state, self.engine, self.cfg, self._save_config,
@@ -205,12 +209,13 @@ class Dashboard(QMainWindow):
         )
 
         self.tabs.addTab(self.dash_view,     self.state.t("tab_dashboard"))
+        self.tabs.addTab(self.threats_view,  self.state.t("tab_threats"))
         self.tabs.addTab(self.event_list,    self.state.t("tab_events"))
         self.tabs.addTab(self.conn_map,      self.state.t("tab_connections"))
         self.tabs.addTab(self.device_list,   self.state.t("tab_devices"))
         self.tabs.addTab(self.module_status, self.state.t("tab_protection"))
-        self.tabs.addTab(self.firewall_view, "Firewall")
-        self.tabs.addTab(self.settings_view, "Settings")
+        self.tabs.addTab(self.firewall_view, self.state.t("tab_firewall"))
+        self.tabs.addTab(self.settings_view, self.state.t("tab_settings"))
 
         # Load custom profiles into combo (Task 15)
         self._custom_profiles = list(self.cfg.custom_profiles)
@@ -306,17 +311,34 @@ class Dashboard(QMainWindow):
         if event.level == ThreatLevel.DANGEROUS:
             self.threat_widget.update_level(ThreatLevel.DANGEROUS)
             self.dash_view.update_threat_level(ThreatLevel.DANGEROUS)
-            self._tray.notify_danger(
-                self.state.t("notif_danger_title"),
-                event.message,
-            )
+            if self._may_notify(ThreatLevel.DANGEROUS):
+                self._tray.notify_danger(
+                    self.state.t("notif_danger_title"),
+                    event.message,
+                )
         elif event.level == ThreatLevel.SUSPICIOUS:
             self.threat_widget.update_level(ThreatLevel.SUSPICIOUS)
             self.dash_view.update_threat_level(ThreatLevel.SUSPICIOUS)
-            self._tray.notify_warning(
-                self.state.t("notif_warn_title"),
-                event.message,
-            )
+            if self._may_notify(ThreatLevel.SUSPICIOUS):
+                self._tray.notify_warning(
+                    self.state.t("notif_warn_title"),
+                    event.message,
+                )
+
+    def _may_notify(self, level: ThreatLevel) -> bool:
+        """Whether ``level`` is allowed to raise a desktop popup.
+
+        The dashboard event list always gets the event; this gates only the
+        tray notification, per cfg.notify_min_level ("dangerous" | "suspicious"
+        | "off"). Unknown values fall back to the default rather than silently
+        muting alerts.
+        """
+        setting = str(getattr(self.cfg, "notify_min_level", "dangerous")).lower()
+        if setting == "off":
+            return False
+        if setting == "suspicious":
+            return True
+        return level == ThreatLevel.DANGEROUS
 
     # ── Controls ─────────────────────────────────────────────────────────
 
@@ -342,7 +364,7 @@ class Dashboard(QMainWindow):
             custom_profiles = getattr(self, '_custom_profiles', self.cfg.custom_profiles)
             if custom_idx < len(custom_profiles):
                 p = custom_profiles[custom_idx]
-                asyncio.create_task(self._apply_custom_profile(p))
+                asyncio.ensure_future(self._apply_custom_profile(p))
 
     async def _apply_custom_profile(self, p) -> None:
         await self.engine.apply_custom_profile(p)
@@ -363,6 +385,31 @@ class Dashboard(QMainWindow):
         save_config(self.cfg)
 
     def _quit_with_summary(self) -> None:
+        # Route through an async step so the incoming-block shield can be torn
+        # down before the process exits.
+        asyncio.ensure_future(self._async_quit())
+
+    async def _async_quit(self) -> None:
+        # The inbound shield used to be torn down here, on the grounds that its
+        # --permanent zone target outlives the process. That traded a security
+        # property for tidiness: quitting the app silently opened the machine
+        # up, and now that lowering the shield requires authorisation it would
+        # also put a password prompt in the way of closing a window. The shield
+        # stays; the summary says so, with the way to undo it.
+        self._shield_left_up = False
+        try:
+            fw = self.engine._fw()
+            self._shield_left_up = bool(fw and (await fw.sync_state()).incoming_blocked)
+        except Exception:
+            pass
+        # Flush attacker dossiers so nothing learned this session is lost.
+        try:
+            self.engine.incidents.save()
+        except Exception:
+            pass
+        self._show_summary_and_quit()
+
+    def _show_summary_and_quit(self) -> None:
         tbl = self.event_list._table
         total = tbl.rowCount()
         dangerous  = 0
@@ -377,7 +424,8 @@ class Dashboard(QMainWindow):
             elif "suspic" in txt:
                 suspicious += 1
 
-        if total == 0:
+        shield_up = getattr(self, "_shield_left_up", False)
+        if total == 0 and not shield_up:
             QApplication.instance().quit()
             return
 
@@ -407,6 +455,14 @@ class Dashboard(QMainWindow):
             row.addStretch()
             row.addWidget(val)
             layout.addLayout(row)
+
+        if shield_up:
+            # Never let a protection outlive the app without saying so — an
+            # unexplained DROP zone is a support ticket waiting to happen.
+            note = QLabel(self.state.t("quit_shield_note"))
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #888; font-size: 11px; padding-top: 6px;")
+            layout.addWidget(note)
 
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         btns.accepted.connect(dlg.accept)
@@ -451,10 +507,8 @@ class Dashboard(QMainWindow):
             self.profile_combo.setItemText(i, self.state.t(i18n_key))
         self.profile_combo.blockSignals(False)
 
-        self.tabs.setTabText(0, self.state.t("tab_dashboard"))
-        self.tabs.setTabText(1, self.state.t("tab_events"))
-        self.tabs.setTabText(2, self.state.t("tab_connections"))
-        self.tabs.setTabText(3, self.state.t("tab_devices"))
-        self.tabs.setTabText(4, self.state.t("tab_protection"))
-        self.tabs.setTabText(5, "Firewall")
-        self.tabs.setTabText(6, "Settings")
+        for index, key in enumerate((
+            "tab_dashboard", "tab_threats", "tab_events", "tab_connections",
+            "tab_devices", "tab_protection", "tab_firewall", "tab_settings",
+        )):
+            self.tabs.setTabText(index, self.state.t(key))

@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# Maze Guard post-install hooks
+# Handles venv creation, Python package install/upgrade, and the helper daemon.
+
+_INSTALL_DIR="/opt/maze-guard"
+_VENV="$_INSTALL_DIR/venv"
+_PIP="$_VENV/bin/pip"
+
+_PACKAGES=(
+    "scapy>=2.5.0"
+    "httpx>=0.27.0"
+    "PyQt6>=6.6.0"
+    "qasync>=0.27.0"
+    "cryptography>=42.0.0"
+)
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+_info()  { echo "  [maze-guard] $*"; }
+_warn()  { echo "  [maze-guard] WARNING: $*"; }
+_ok()    { echo "  [maze-guard] ✓ $*"; }
+
+_setup_venv() {
+    _info "Creating Python virtual environment at $_VENV ..."
+    python3 -m venv "$_VENV"
+
+    _info "Upgrading pip ..."
+    "$_PIP" install --quiet --upgrade pip
+}
+
+_install_packages() {
+    _info "Installing Python packages into venv ..."
+    "$_PIP" install --quiet "${_PACKAGES[@]}"
+    _ok "Core packages installed"
+}
+
+_install_dbus_python() {
+    # Try pip first; fall back to linking system python-dbus into the venv
+    if "$_PIP" install --quiet "dbus-python>=1.3.2" 2>/dev/null; then
+        _ok "dbus-python installed via pip"
+        return
+    fi
+
+    _warn "dbus-python pip build failed — linking system python-dbus ..."
+
+    local sys_site venv_site
+    sys_site=$(python3 -c \
+        "import sysconfig; print(sysconfig.get_path('purelib'))" 2>/dev/null)
+    venv_site=$("$_VENV/bin/python3" -c \
+        "import sysconfig; print(sysconfig.get_path('purelib'))" 2>/dev/null)
+
+    if [[ -z "$sys_site" || -z "$venv_site" ]]; then
+        _warn "Could not determine site-packages paths — dbus integration may be unavailable"
+        return
+    fi
+
+    local linked=0
+    for item in dbus _dbus_bindings.so _dbus_glib_bindings.so; do
+        if [[ -e "$sys_site/$item" ]]; then
+            ln -sf "$sys_site/$item" "$venv_site/"
+            (( linked++ )) || true
+        fi
+    done
+
+    if (( linked > 0 )); then
+        _ok "Linked system python-dbus into venv ($linked item(s))"
+    else
+        _warn "System python-dbus not found — NetworkManager integration unavailable"
+    fi
+}
+
+_fix_permissions() {
+    chown -R root:root "$_INSTALL_DIR"
+    find "$_INSTALL_DIR" -type d  -exec chmod 755 {} +
+    find "$_INSTALL_DIR" -type f  -exec chmod 644 {} +
+    find "$_VENV/bin"   -type f  -exec chmod 755 {} + 2>/dev/null || true
+    chmod 755 "$_INSTALL_DIR/main.py"
+    chmod 755 "$_INSTALL_DIR/maze/helper.py"
+}
+
+_refresh_desktop() {
+    command -v gtk-update-icon-cache &>/dev/null && \
+        gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null || true
+    command -v update-desktop-database &>/dev/null && \
+        update-desktop-database /usr/share/applications 2>/dev/null || true
+}
+
+_setup_group() {
+    # systemd-sysusers normally creates 'maze' from /usr/lib/sysusers.d/maze-guard.conf.
+    # That hook runs as a PostTransaction hook, i.e. AFTER this post_install runs,
+    # so the group is NOT guaranteed to exist yet when we get here — create it
+    # ourselves (idempotent) so ordering never matters.
+    getent group maze >/dev/null 2>&1 || groupadd -r maze 2>/dev/null || true
+}
+
+# Best-effort discovery of the unprivileged desktop user pacman/the AUR helper
+# was invoked for.
+_real_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "$SUDO_USER"
+        return
+    fi
+    logname 2>/dev/null || true
+}
+
+# Actually add the user to the group instead of just printing instructions —
+# so the daemon socket works right after install/reboot with no manual step.
+_add_user_to_group() {
+    local real_user
+    real_user="$(_real_user)"
+    if [ -n "$real_user" ]; then
+        if usermod -aG maze "$real_user" 2>/dev/null; then
+            _ok "Added '$real_user' to the 'maze' group"
+        else
+            _warn "Could not add '$real_user' to 'maze' automatically — run: sudo usermod -aG maze $real_user"
+        fi
+    else
+        _warn "Could not determine the installing user — add yourself manually: sudo usermod -aG maze <your-user>"
+    fi
+}
+
+_enable_daemon() {
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable --now maze-guard.service 2>/dev/null \
+        && _ok "maze-guard.service enabled and started" \
+        || _warn "Could not enable maze-guard.service automatically — run: sudo systemctl enable --now maze-guard.service"
+}
+
+# Put the freshly installed helper into service.
+#
+# `systemctl try-restart` — what this used to do — is a no-op when the unit is
+# enabled but not currently running, which is exactly the state left behind by a
+# crash, a manual stop, or an install whose first start failed. The upgrade then
+# reported success while the machine had no helper at all. Decide from the unit's
+# actual state instead, and never start a daemon the user deliberately disabled.
+_restart_daemon() {
+    systemctl daemon-reload 2>/dev/null || true
+
+    local action=""
+    if systemctl is-active --quiet maze-guard.service 2>/dev/null; then
+        action="restart"
+    elif systemctl is-enabled --quiet maze-guard.service 2>/dev/null; then
+        action="start"
+    else
+        _info "maze-guard.service is disabled — leaving it alone"
+        return
+    fi
+
+    if systemctl "$action" maze-guard.service 2>/dev/null \
+       && systemctl is-active --quiet maze-guard.service 2>/dev/null; then
+        _ok "maze-guard.service is running the new build"
+    else
+        _warn "maze-guard.service did not come up — check: journalctl -u maze-guard.service -e"
+        _warn "Until it does, Maze Guard runs in limited (detection-only) mode."
+    fi
+}
+
+_print_summary() {
+    # Self-aligning box: content is ASCII-only so printf byte-width == columns.
+    local w=54
+    _boxline() { printf "  | %-*s |\n" "$w" "$1"; }
+    local bar; bar="$(printf '%*s' "$((w+2))" '' | tr ' ' '-')"
+    echo ""
+    printf "  +%s+\n" "$bar"
+    _boxline "Maze Guard installed - run: maze-guard"
+    _boxline ""
+    _boxline "The privileged helper runs as a daemon - no"
+    _boxline "password prompt. Your user was added to the"
+    _boxline "'maze' group automatically - log out and back"
+    _boxline "in (or reboot) for it to take effect."
+    _boxline ""
+    _boxline "Autostart launches Maze Guard hidden in the tray."
+    printf "  +%s+\n" "$bar"
+    echo ""
+}
+
+# ── hooks ─────────────────────────────────────────────────────────────────────
+
+post_install() {
+    _setup_venv
+    _install_packages
+    _install_dbus_python
+    _fix_permissions
+    _refresh_desktop
+    _setup_group
+    _add_user_to_group
+    _enable_daemon
+    _print_summary
+}
+
+post_upgrade() {
+    if [[ ! -x "$_VENV/bin/python3" ]]; then
+        # venv missing or broken — recreate fully
+        rm -rf "$_VENV"
+        post_install
+        return
+    fi
+
+    _info "Upgrading Python packages in venv ..."
+    "$_PIP" install --quiet --upgrade "${_PACKAGES[@]}"
+    "$_PIP" install --quiet --upgrade "dbus-python>=1.3.2" 2>/dev/null || true
+    _fix_permissions
+    _refresh_desktop
+    _setup_group
+    _add_user_to_group
+    # Pick up unit changes and put the new helper into service. This matters
+    # more than it looks: the GUI and the root helper speak a versioned command
+    # set, so a helper left on the old code makes newly added privileged
+    # operations fail silently while everything still *looks* healthy.
+    _restart_daemon
+    _ok "Maze Guard upgraded"
+    _info "Quit and relaunch the Maze Guard window to load the new version."
+}
+
+pre_remove() {
+    # Stop and disable the daemon before its files disappear.
+    systemctl disable --now maze-guard.service 2>/dev/null || true
+}
+
+post_remove() {
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf /run/maze 2>/dev/null || true
+    # venv is inside /opt/maze which pacman already removed; just refresh caches
+    _refresh_desktop
+}

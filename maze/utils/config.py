@@ -15,7 +15,6 @@ def _detect_interface() -> str:
 @dataclass
 class CustomProfileConfig:
     name: str
-    mac_randomize: bool = False
     hide_hostname: bool = False
     block_incoming: bool = False
     doh_enabled: bool = False
@@ -36,25 +35,41 @@ class CustomProfileConfig:
 @dataclass
 class MazeConfig:
     interface: str = field(default=None)
-    mac_rotation_minutes: int = 30
     port_scan_threshold: int = 25
     theme: str = "dark"
     language: str = "en"
     profile: str = "home"
     auto_profile_switch: bool = False
+    # Lowest threat level allowed to raise a DESKTOP (tray) notification.
+    # "dangerous" (default) | "suspicious" | "off"
+    #
+    # Everything still lands in the dashboard event list regardless — this only
+    # governs the popup. SUSPICIOUS is deliberately not a popup by default: it
+    # is the level used for "worth a look" heuristics (a handful of ports
+    # probed, an unfamiliar process opening a socket), which on a workstation
+    # fires often enough during ordinary work — running a scan, booting a VM,
+    # a torrent client warming up — that the popups became noise people learn
+    # to dismiss, which is worse than not showing them. Real, confirmed threats
+    # (ARP spoofing, a sustained scan) are DANGEROUS and still pop up.
+    notify_min_level: str = "dangerous"
+    # Whether a confirmed active attacker (port scan, stealth scan, correlated
+    # multi-stage activity) gets a firewall drop rule automatically after
+    # reconnaissance. Infrastructure (gateway, DNS), whitelisted addresses and
+    # public — therefore spoofable — sources are excluded regardless.
+    auto_block: bool = True
     known_processes: list = field(default_factory=lambda: [
         # Browsers
         "firefox", "chromium", "brave", "brave-browser", "chrome",
         "chromium-browser", "opera", "vivaldi", "librewolf", "floorp",
         # VPN clients
-        "protonvpn-app", "protonvpn", "proton-vpn-gnom", "openvpn",
+        "protonvpn-app", "protonvpn", "proton-vpn-gnome", "openvpn",
         "wg", "wg-quick", "nordvpn", "mullvad", "expressvpn",
         "openconnect", "vpnc", "wireguard",
         # Privacy / anonymity / mesh networking (make their own outbound conns)
-        "tor", "tor-real", "obfs4proxy", "snowflake-clien", "i2pd",
+        "tor", "tor-real", "obfs4proxy", "snowflake-client", "i2pd",
         "mullvad-daemon", "tailscaled", "tailscale", "zerotier-one",
         # Time / sync daemons
-        "chronyd", "ntpd", "systemd-timesyn",
+        "chronyd", "ntpd", "systemd-timesyncd",
         # Music / media streaming
         "spotify", "Spotify", "spotifyd",
         "rhythmbox", "clementine", "strawberry", "lollypop",
@@ -82,6 +97,8 @@ class MazeConfig:
         "ssh-agent", "gpg-agent", "dbus-daemon",
         "pipewire", "wireplumber", "pulseaudio",
         "bluetoothd", "obexd",
+        # AI / local model servers
+        "ollama", "ollama_llama_ser",
         # Dev tools
         "curl", "wget", "ssh", "git", "python3", "python", "node",
         "npm", "cargo", "rustup", "code", "claude",
@@ -127,8 +144,9 @@ def load_config() -> MazeConfig:
             if cfg.port_scan_threshold == 10:
                 cfg.port_scan_threshold = 25
             return cfg
-        except Exception:
-            pass
+        except Exception as e:
+            from maze.utils.logger import log
+            log.warning(f"Failed to load config, using defaults: {e}")
     return MazeConfig()
 
 

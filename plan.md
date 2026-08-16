@@ -70,7 +70,7 @@ Hostname Gizleme
 
 Servis Keşfini Engelle
   → dışarıya açık dinleme portlarını tespit et
-  → "Gizle" → o porta gelen bağlantıları drop et (nftables)
+  → "Gizle" → o porta gelen bağlantıları drop et (firewalld)
 
 Passive OS Fingerprint Koruması
   → TCP/IP stack parametrelerini normalize et
@@ -134,7 +134,7 @@ Otomatik tetikleme
 |---|---|
 | Paket yakalama | `scapy` |
 | DNS doğrulama | `httpx` (DoH) |
-| Firewall | `nftables` (python-nftables) |
+| Firewall | `firewalld` (rich rules via helper) |
 | NetworkManager | `dbus-python` |
 | MAC değiştirme | `iproute2` / `ip link` subprocess |
 | Process-network map | `/proc/net/tcp` + `/proc/PID/fd` |

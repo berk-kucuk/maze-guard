@@ -13,7 +13,6 @@ class ProfileDialog(QDialog):
     _FEATURES = [
         ("port_scan_detect",   "Port scan detection"),
         ("process_monitor",    "Unknown process monitoring"),
-        ("mac_randomize",      "MAC address randomization"),
         ("hide_hostname",      "Hide hostname (disable mDNS)"),
         ("fingerprint_protect","TCP fingerprint protection"),
         ("block_incoming",     "Block unsolicited incoming connections"),

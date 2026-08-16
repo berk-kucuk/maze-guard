@@ -3,17 +3,31 @@ import os
 import subprocess
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
 
+_BSSID_CONFIRM_COUNT = 3  # must persist across this many checks
+
 
 def _is_wireless(interface: str) -> bool:
     return os.path.exists(f"/sys/class/net/{interface}/wireless")
 
 
 class RogueAPDetector:
+    """Detect Evil Twin / Rogue Access Points.
+
+    A genuine multi-AP WiFi network (mesh, campus, office) shares one SSID
+    across dozens of BSSIDs. Roaming from one AP to another is normal.
+    This detector maintains a GROWING set of known BSSIDs for the current
+    SSID and only alerts when a genuinely NEW BSSID appears AND persists
+    across multiple confirmation cycles — a single blip or normal roam
+    does not trigger.
+    """
+
     def __init__(self, interface: str):
         self.interface = interface
         self._is_wifi = _is_wireless(interface)
-        self._known_bssid: str | None = None
+        self._known_bssids: set[str] = set()
         self._known_ssid: str | None = None
+        self._pending_bssid: str | None = None
+        self._pending_count: int = 0
         self._redirects_warned = False
         self._bus: EventBus | None = None
         self._task: asyncio.Task | None = None
@@ -21,9 +35,10 @@ class RogueAPDetector:
     async def start(self, bus: EventBus) -> None:
         self._bus = bus
         if self._is_wifi:
-            self._known_ssid, self._known_bssid = await asyncio.to_thread(
-                self._current_ap
-            )
+            ssid, bssid = await asyncio.to_thread(self._current_ap)
+            self._known_ssid = ssid
+            if bssid:
+                self._known_bssids.add(bssid)
         self._task = asyncio.create_task(self._monitor())
 
     async def stop(self) -> None:
@@ -43,31 +58,43 @@ class RogueAPDetector:
             return None, None
 
     async def _monitor(self) -> None:
-        # One-time ICMP redirect check (both WiFi and Ethernet)
         await self._check_icmp_redirects()
         while True:
             await asyncio.sleep(15)
             if self._is_wifi:
                 ssid, bssid = await asyncio.to_thread(self._current_ap)
-                if ssid and ssid == self._known_ssid and bssid != self._known_bssid:
-                    await self._bus.emit(Event(
-                        type=EventType.ROGUE_AP,
-                        level=ThreatLevel.DANGEROUS,
-                        message=f"Evil Twin AP detected: '{ssid}' BSSID changed "
-                                f"({self._known_bssid} → {bssid})",
-                        data={"ssid": ssid,
-                              "old_bssid": self._known_bssid,
-                              "new_bssid": bssid},
-                    ))
+                if not ssid or not bssid:
+                    self._pending_bssid = None
+                    self._pending_count = 0
+                    continue
+                if self._known_ssid and ssid == self._known_ssid:
+                    if bssid not in self._known_bssids:
+                        if self._pending_bssid == bssid:
+                            self._pending_count += 1
+                            if self._pending_count >= _BSSID_CONFIRM_COUNT:
+                                self._known_bssids.add(bssid)
+                                self._pending_bssid = None
+                                self._pending_count = 0
+                                await self._bus.emit(Event(
+                                    type=EventType.ROGUE_AP,
+                                    level=ThreatLevel.SUSPICIOUS,
+                                    message=f"New AP detected for '{ssid}': "
+                                            f"BSSID {bssid} — possible Evil Twin",
+                                    data={"ssid": ssid, "bssid": bssid},
+                                ))
+                        else:
+                            self._pending_bssid = bssid
+                            self._pending_count = 1
+                    else:
+                        self._pending_bssid = None
+                        self._pending_count = 0
+                else:
+                    self._known_ssid = ssid
+                    self._known_bssids = {bssid}
+                    self._pending_bssid = None
+                    self._pending_count = 0
 
     async def _check_icmp_redirects(self) -> None:
-        """Alert if ICMP redirect acceptance is enabled on a wireless interface.
-
-        ICMP redirect attacks require a rogue device on the same L2 segment and
-        are only practically exploitable on shared wireless networks. On wired
-        home connections the router itself may legitimately send redirects, so
-        warning there produces constant false positives with no security value.
-        """
         if not self._is_wifi:
             return
         try:

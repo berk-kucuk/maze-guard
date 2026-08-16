@@ -10,8 +10,7 @@ from PyQt6.QtGui import QColor
 from maze.core.events import ThreatLevel
 from maze.gui.theme import THREAT_COLORS
 from maze.utils.network_info import (
-    get_interface_info, get_open_ports, get_firewall_status,
-    get_active_physical_interface, parse_firewall_output,
+    get_interface_info, get_open_ports, get_active_physical_interface,
 )
 
 
@@ -331,37 +330,54 @@ class DashboardView(QWidget):
         self._net_card.update_value("vpn_val", vpn_text)
 
     async def _refresh_firewall(self) -> None:
-        s = self._state
-        helper = getattr(self._engine, 'helper', None)
-        if helper and helper.is_connected():
-            raw = await helper.nft_list()
-            fw = parse_firewall_output(raw)
-        else:
-            fw = get_firewall_status()
+        """Paint the firewall card from the engine's live state.
 
-        needs_root = fw.maze_profile in ("(needs root)", "(nft not found)")
-        if needs_root:
+        Deriving "is the firewall on" from the presence of --list-all output —
+        the previous approach — could not tell a stopped firewall apart from an
+        unreachable helper, so a card reading "Active" was not evidence of
+        anything. The engine answers the question directly.
+        """
+        s = self._state
+        state = await self._engine.firewall_state()
+        helper = getattr(self._engine, 'helper', None)
+
+        if not state.installed:
             dot_color = "#555555"
-            status_text = fw.maze_profile
-        elif fw.maze_profile:
+            status_text = (s.t("dash_fw_inactive") if helper
+                           else "(needs root)")
+        elif not state.running:
+            dot_color = THREAT_COLORS["dangerous"]
+            status_text = s.t("status_stopped")
+        elif state.incoming_blocked:
             dot_color = THREAT_COLORS["safe"]
-            status_text = f"Maze · {fw.maze_profile}"
-        elif fw.active:
-            dot_color = THREAT_COLORS["suspicious"]
-            status_text = s.t("dash_fw_active")
+            status_text = f"{s.t('status_running')} · {s.t('module_firewall')}"
         else:
             dot_color = THREAT_COLORS["suspicious"]
-            status_text = s.t("dash_fw_inactive")
+            status_text = s.t("status_running")
 
         self._fw_card.update_dot("fw_status", dot_color)
         self._fw_card.update_value("fw_status", status_text)
-        profile_text = fw.maze_profile if not needs_root else s.t("dash_fw_none")
-        self._fw_card.update_value("fw_profile_val",
-                                   f"{s.t('dash_fw_profile')}:  {profile_text}")
-        rules_count = len(fw.rule_lines)
-        self._fw_card.update_value("fw_rules_val",
-                                   f"{rules_count} rules active" if rules_count else s.t("dash_no_rules"))
-        self._rules_section.set_content(fw.rules_raw or s.t("dash_no_rules"))
+        self._fw_card.update_value(
+            "fw_profile_val",
+            f"{s.t('dash_fw_profile')}:  {state.zone or s.t('dash_fw_none')}")
+
+        rules = state.rules or {}
+        count = (len(rules.get("ips", [])) + len(rules.get("ports_tcp", []))
+                 + len(rules.get("ports_udp", [])))
+        self._fw_card.update_value(
+            "fw_rules_val",
+            f"{count} rules active" if count else s.t("dash_no_rules"))
+
+        # The rule pane still shows firewalld's own rendering — it is the
+        # authoritative text, and useful to read verbatim. Only ask when there
+        # is something to ask: querying a stopped firewalld is a question with a
+        # known answer, and one this timer would repeat every few seconds.
+        raw = ""
+        if state.running and helper and helper.is_connected():
+            raw = await helper.fw_list_all()
+        elif state.installed and not state.running:
+            raw = s.t("status_stopped")
+        self._rules_section.set_content(raw or s.t("dash_no_rules"))
 
     def _refresh_ports(self) -> None:
         s = self._state
