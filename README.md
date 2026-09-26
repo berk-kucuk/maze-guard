@@ -27,6 +27,27 @@ Maze Guard is a Linux desktop application that monitors your network in real tim
 
 The GUI runs as your normal user. A small privileged helper runs as a **systemd daemon** (root) that handles packet capture and firewall rules. Because the daemon is started by systemd, the GUI never needs your password — credential handling is removed entirely, which closes off the password-prompt privilege-escalation surface.
 
+
+### What it does not cover
+
+Maze Guard watches **the network you are connected to**. Within that scope it is
+thorough, and it names the source: every hostile device gets a dossier with its
+MAC, vendor, hostname, guessed OS, everything it was seen doing, and what Maze
+Guard did about it. If someone attacks you on a cafe or hotel network, you will
+know which device it was.
+
+It is not a whole-system security suite, and these attacks look normal to it:
+
+| Not covered | Why | What does cover it |
+|---|---|---|
+| Phishing — you typed your password into a fake site | Ordinary HTTPS to a real server | Browser warnings, a password manager that refuses to autofill on the wrong domain |
+| Malware already running on your machine | Maze Guard sees processes holding sockets, not what they do | Qlam (ClamAV), firejail sandboxing |
+| A breach at a service you use | Nothing on your machine is involved | Unique passwords, 2FA, breach notifications |
+| Someone with physical access to a powered-off machine | Not a network event | LUKS encryption, Secure Boot |
+
+Knowing the edge of the sensor is part of trusting it. A tool that claims to
+catch everything teaches you to stop checking.
+
 ---
 
 ## Features
@@ -38,39 +59,45 @@ The GUI runs as your normal user. A small privileged helper runs as a **systemd 
 | **Port Scan Detector** | SYN sweeps by distinct-port breadth, plus FIN/NULL/XMAS stealth probes, with per-source evidence (ports, rate, duration) |
 | **Anomaly & Correlation** | ARP host-discovery storms, ICMP ping sweeps and recon probes, rogue DHCP servers, one MAC claiming many IPs — and joins separate detections from one source into a single attack chain |
 | **DNS Validator** | DNS poisoning (cross-checks 3 DoH resolvers) |
-| **DNS Leak Preventer** | Plaintext DNS queries escaping VPN tunnel |
+| **DNS Leak Preventer** | Plaintext DNS queries escaping the VPN tunnel, or going to a resolver you never configured — judged live, as each query leaves |
 | **TLS Monitor** | Certificate hash changes for canary hosts |
-| **SSL Strip Detector** | HTTP downgrade attacks on known-HTTPS hosts |
-| **Rogue AP Detector** | Evil Twin APs (BSSID changes), ICMP redirects |
+| **HTTPS Downgrade Detector** | Plaintext HTTP to a host that served us TLS earlier and whose 443 has since stopped answering |
+| **Rogue AP Detector** | Evil Twin APs (new BSSID for the current SSID, read via `iw`, `iwgetid` or `nmcli`), and ICMP-redirect exposure — the latter on wired links too |
 | **Process Monitor** | Unknown processes making external connections |
+| **IPv6 Router Watch** | Forged Router Advertisements — the IPv6 MITM: no lease, no race, the attacker simply announces itself as your router and your system configures itself from it |
+| **Device Inventory** | A device that has never been on *this* network before joining it — keyed by MAC and scoped per network (SSID / gateway MAC), so a DHCP renewal is not a stranger and a stranger is not a renewal |
 
 ### Protection
 | Feature | Description |
 |---|---|
 | **Firewall Control** | Start/stop firewalld itself, and toggle the inbound-DROP shield, from the Protection tab — with live state read back from the firewall, not remembered in the UI |
 | **firewalld Integration** | Rich rules on the *actual* default zone (IPv4 and IPv6), each carrying a rate-limited kernel log line so every block is auditable |
-| **Hostname Hiding** | Disables mDNS/Avahi to hide device hostname on LAN |
-| **TCP Fingerprint** | Randomizes TTL and TCP window scaling via sysctl |
-| **Service Blocker** | Closes listening services on untrusted networks |
+| **Hostname Hiding** | Stops the mDNS responder (avahi) *and disarms its systemd activation socket*, so a local `.local` lookup cannot silently restart it |
+| **TCP Fingerprint** | Normalises the IPv4 TTL and IPv6 hop limit, and removes TCP timestamps (uptime leak); originals are recorded on disk so a crash cannot lose them |
+| **Service Blocker** | Drops inbound mDNS, LLMNR, NetBIOS, SMB, SSDP and WS-Discovery (IPv4 and IPv6) so the machine stops answering discovery probes |
+| **Hardware Blocking** | Blocking a source also drops its MAC address. An IP is a DHCP lease — a host that renews it walks around an address block; the MAC is the device, and one rule covers its IPv4 and IPv6 addresses at once |
+| **Post-block Evidence** | Every rule logs what it swallows, and those kernel log lines are read back into the dossier: how many packets the block ate, which ports were tried, when the last attempt was. Whether an attacker gave up or kept working at it for an hour is the part that says what they were |
 
 ### Interface
 - **Dashboard** — Live network info, firewall status, threat level, bandwidth monitor (↓/↑ per second), port scan table
 - **Threats** — One dossier per attacking source: severity score, identity (MAC, vendor, hostname, OS), techniques used, ports they probed, what they are running, full timeline, and Block / Scan Source / Export Report actions
-- **Events** — Filterable event log (All / Suspicious / Dangerous), text search, CSV export
+- **Events** — Filterable event log (All / Suspicious / Dangerous), text search, CSV export. Selecting an event explains it in two sentences: what the observation actually means, and the next thing worth doing — a detection nobody can act on has done half a job
 - **Firewall** — Add/remove blocked IPs and ports with instant feedback
-- **Devices** — All discovered LAN devices with MAC addresses
+- **Devices** — Every device on this network, and whether it belongs here. The inventory is keyed by **MAC** and scoped **per network**, so it survives DHCP: name a device once and it stays named; mark it known and it stops being flagged. Anything that has never been on this network before raises an alert — after a short learning window on a network you have not visited, so joining a café does not alert on forty strangers at once. Right-click any device for reconnaissance at three depths (**Quick** ~25 ports, **Standard** ~100 with banners and TLS, **Thorough** ports 1-1024), on one device or all of them, with live progress. Each dossier names the thing: MAC vendor, NetBIOS/mDNS/UPnP name, manufacturer and model, device type (printer, camera, router, NAS, mobile…), OS, open ports with service banners, TLS certificate identity, latency and a risk score with plain-language findings — exportable as a Markdown report. The router is labelled from the routing table rather than guessed. Scan results are held in memory only and expire after 15 minutes, when a different MAC appears behind that IP, or when you join another network
 - **Connections** — Live process→IP connection map
-- **Protection** — Per-module toggle switches
+- **Protection** — Per-module toggle switches with a **Test** button beside each one, plus **Test everything**. A test asks the *system* — systemd, firewalld, the kernel, a live socket — or pushes a synthetic attack through the real analysis path, and reports what is true right now. Run it with a protection off and then on: the difference between the two answers is what that protection does. Each row also carries a line saying what the module is *actually* doing ("no packet feed — sweeps are invisible", "8 inbound ports dropped", "enp42s0 is not wireless"). A module that refuses to start says why, on the spot, instead of flicking back to off in silence
 - **Settings** — Threshold tuning, process whitelist, IP whitelist, autostart toggle
+- **First run** — Four questions on a fresh install: which interface to watch, whether this network is trusted, whether to block attackers automatically, whether to start at login. Never shown to an existing install, and never blocks a launch
 
 ### Other
-- **IP Reconnaissance** — Auto-triggered on confirmed attacks (and on demand): reverse DNS, NetBIOS and mDNS names, MAC vendor, ~90-port sweep with service banners, TLS certificate identity, HTTP server and page title, OS fingerprint, latency, and a risk score with plain-language findings ("port 4444 open — Metasploit default handler port"). Only ever runs against on-link private addresses, never a spoofable public source
+- **IP Reconnaissance** — Auto-triggered on confirmed attacks (and on demand): reverse DNS, NetBIOS, mDNS and UPnP names, MAC vendor, manufacturer/model, a port sweep with service banners, TLS certificate identity, HTTP server and page title, OS fingerprint, latency (ICMP, falling back to TCP handshake timing when ping is filtered), and a risk score with plain-language findings ("port 4444 open — Metasploit default handler port"). Only ever runs against on-link private addresses, never a spoofable public source. A confirmed attacker is **blocked before** the sweep starts, not after it
 - **Incident Records** — Every hostile source is filed to `~/.local/share/maze-guard/`: an append-only evidence journal plus a dossier snapshot that survives restarts, exportable as a Markdown incident report
 - **Custom Profiles** — Create named security profiles with per-feature toggles
 - **Persistent Log** — All events written to `~/.config/maze/maze.log` (rotating, 2 MB × 3)
 - **System Tray** — Starts hidden in the tray on login (autostart); click the tray icon to show the window; desktop notifications for dangerous events
 - **Session Summary** — Event count breakdown shown on quit
-- **English + Turkish** UI with live language switching
+- **IPv6** — Detection is not IPv4-only: v6 TCP scans are counted the same way, our own v6 addresses are recognised as ours, reconnaissance works against v6 targets, and a block applies to both families at once when the hardware address is known
+- **English + Turkish** UI with live language switching, verified by tests that fail if the two tables drift or an interface string is missing
 
 ---
 
@@ -208,6 +235,28 @@ Exit status is non-zero if any check failed, so it can gate a deployment.
 The check exists because the failure that matters for a security tool is not a
 crash, it is a module that reports *Active* while silently doing nothing.
 
+### Developing
+
+```bash
+./scripts/check.sh
+```
+
+Runs everything that has to be true before a release: every module compiles,
+the full test suite, the three version numbers agree, no debug statements
+survived, and the privileged helper still accepts nothing but `drop` rules.
+`--quick` skips the end-to-end test; `--package` builds the Arch package after
+the checks pass.
+
+The suite includes an **end-to-end detection test** that needs no root: it opens
+an unprivileged user + network namespace, makes real TCP connections to closed
+ports on a private loopback, and asserts that the shipping capture path,
+classifier and event bus produce the alert. That is the test that used to be a
+phone running nmap and a person watching the screen.
+
+```bash
+./venv/bin/python -m unittest discover -s tests -v
+```
+
 ### Profiles
 
 Select a security profile from the top bar:
@@ -247,6 +296,9 @@ Config is stored at `~/.config/maze/config.json` and is updated automatically wh
   "theme": "dark",
   "language": "en",
   "port_scan_threshold": 10,
+  "device_intel_ttl": 900,
+  "notify_new_devices": true,
+  "block_by_mac": true,
   "known_processes": ["firefox", "brave", "curl", "..."],
   "whitelist_ips": [],
   "custom_profiles": []
@@ -257,6 +309,10 @@ Config is stored at `~/.config/maze/config.json` and is updated automatically wh
 |---|---|
 | `interface` | Network interface to monitor (auto-detected if missing or down) |
 | `port_scan_threshold` | SYN packets from one IP before a SUSPICIOUS alert fires |
+| `device_intel_ttl` | Seconds a gathered device dossier stays valid in the Devices tab |
+| `notify_new_devices` | Desktop notification when an unrecognised device joins this network |
+| `block_by_mac` | Whether blocking a source also blocks its hardware address |
+| `trusted_networks` | Network ids (`wifi:SSID` / `gw:MAC`) that get the Home profile |
 | `known_processes` | Processes that will never trigger "unknown process" alerts |
 | `whitelist_ips` | IPs ignored by all detectors (gateway, trusted servers, etc.) |
 | `custom_profiles` | User-defined profiles saved from the `+` dialog |
@@ -296,6 +352,9 @@ maze/
 ├── core/
 │   ├── engine.py          # Module orchestration, event bus, recon trigger
 │   ├── events.py          # Event types, threat levels
+│   ├── device_intel.py    # On-demand device dossiers + network-scoped TTL cache
+│   ├── inventory.py       # Per-network device baseline (persistent, MAC-keyed)
+│   ├── explain.py         # What an event means and what to do about it
 │   ├── incident.py        # Attacker dossiers, scoring, evidence journal
 │   └── profile.py         # Built-in profile definitions
 ├── detection/
@@ -306,6 +365,7 @@ maze/
 │   ├── ssl_strip.py       # SSL strip detection
 │   └── tls_monitor.py     # TLS cert hash monitoring (canary hosts)
 ├── protection/
+│   ├── block_log.py       # Reads our own drop-rule hits back from the kernel log
 │   ├── dns_leak.py        # Plaintext DNS leak detector
 │   ├── firewall.py        # firewalld control: service, shield, rich rules
 │   ├── port_scanner.py    # SYN-breadth + stealth-flag scan detection

@@ -82,43 +82,168 @@ def get_active_vpn_interfaces() -> list[str]:
     return sorted(vpns)
 
 
-def current_network_id(iface: str) -> str:
-    """A stable identifier for the network currently attached to `iface`.
+_MAC_RE = re.compile(r"\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b")
 
-    WiFi networks are identified by SSID; wired networks by the default
-    gateway's MAC address. Returns "" if nothing can be determined (link down).
-    Used by the auto-profile watcher to tell trusted networks apart.
+
+def is_wireless(iface: str) -> bool:
+    return bool(iface) and (Path("/sys/class/net") / iface / "wireless").exists()
+
+
+def _link_via_iw(iface: str) -> tuple[str, str]:
+    out = subprocess.check_output(
+        ["iw", "dev", iface, "link"], text=True,
+        timeout=2, stderr=subprocess.DEVNULL)
+    if "not connected" in out.lower():
+        return "", ""
+    ssid = re.search(r"^\s*SSID:\s*(.+)$", out, re.MULTILINE)
+    bssid = _MAC_RE.search(out)
+    return (ssid.group(1).strip() if ssid else "",
+            bssid.group(1).lower() if bssid else "")
+
+
+def _link_via_nmcli(iface: str) -> tuple[str, str]:
+    # --terse escapes the colons inside a BSSID, so split on unescaped ones.
+    out = subprocess.check_output(
+        ["nmcli", "--terse", "--fields", "IN-USE,SSID,BSSID",
+         "dev", "wifi", "list", "ifname", iface, "--rescan", "no"],
+        text=True, timeout=3, stderr=subprocess.DEVNULL)
+    for line in out.splitlines():
+        if not line.startswith("*"):
+            continue
+        fields = re.split(r"(?<!\\):", line)
+        ssid = fields[1].replace("\\:", ":") if len(fields) > 1 else ""
+        bssid = _MAC_RE.search(line.replace("\\", ""))
+        return ssid, bssid.group(1).lower() if bssid else ""
+    return "", ""
+
+
+def _link_via_iwgetid(iface: str) -> tuple[str, str]:
+    ssid = subprocess.check_output(
+        ["iwgetid", iface, "--raw"], text=True,
+        timeout=2, stderr=subprocess.DEVNULL).strip()
+    bssid = subprocess.check_output(
+        ["iwgetid", iface, "--ap", "--raw"], text=True,
+        timeout=2, stderr=subprocess.DEVNULL).strip().lower()
+    return ssid, bssid if _MAC_RE.fullmatch(bssid or "") else ""
+
+
+def wifi_link(iface: str) -> tuple[str, str]:
+    """(SSID, BSSID) of the access point `iface` is associated with.
+
+    iwgetid alone used to answer this, and it comes from wireless-tools, which
+    is not installed by default: every lookup failed, and the caller fell back
+    to the gateway's MAC — so one WiFi network had two identities that the
+    profile flipped between. `iw` is present wherever WiFi works; NetworkManager
+    and iwgetid are fallbacks. ("", "") when not associated or unreadable.
     """
-    # WiFi: SSID is the natural identity.
-    if (Path("/sys/class/net") / iface / "wireless").exists():
+    if not is_wireless(iface):
+        return "", ""
+    for reader in (_link_via_iw, _link_via_nmcli, _link_via_iwgetid):
         try:
-            ssid = subprocess.check_output(
-                ["iwgetid", iface, "--raw"], text=True,
-                timeout=2, stderr=subprocess.DEVNULL,
-            ).strip()
-            if ssid:
-                return f"wifi:{ssid}"
+            ssid, bssid = reader(iface)
         except Exception:
-            pass
-    # Wired (or SSID unavailable): use the gateway MAC.
+            continue
+        if ssid:
+            return ssid, bssid
+    return "", ""
+
+
+def _gateway_mac(iface: str) -> str:
     try:
         route = subprocess.check_output(
             ["ip", "route", "show", "default", "dev", iface],
             text=True, timeout=2, stderr=subprocess.DEVNULL,
         )
         m = re.search(r"default via (\S+)", route)
-        if m:
-            gw = m.group(1)
-            neigh = subprocess.check_output(
-                ["ip", "neigh", "show", gw], text=True,
-                timeout=2, stderr=subprocess.DEVNULL,
-            )
-            mac = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
-            if mac:
-                return f"gw:{mac.group(1)}"
+        if not m:
+            return ""
+        neigh = subprocess.check_output(
+            ["ip", "neigh", "show", m.group(1), "dev", iface], text=True,
+            timeout=2, stderr=subprocess.DEVNULL,
+        )
+        mac = re.search(r"lladdr\s+([0-9a-f:]{17})", neigh)
+        return mac.group(1) if mac else ""
     except Exception:
-        pass
-    return ""
+        return ""
+
+
+def current_network_id(iface: str) -> str:
+    """A stable identifier for the network currently attached to `iface`.
+
+    WiFi networks are identified by SSID, wired ones by the default gateway's
+    MAC. Returns "" if nothing can be determined (link down, not associated).
+
+    A wireless interface never falls back to the gateway MAC: that fallback
+    gave the same WiFi network a second identity whenever the SSID lookup
+    failed once, and the auto-profile flipped HOME → PUBLIC → HOME with a
+    notification each time. An unreadable SSID is "unknown", and the identity
+    service keeps the last known value for it.
+    """
+    if is_wireless(iface):
+        ssid, _bssid = wifi_link(iface)
+        return f"wifi:{ssid}" if ssid else ""
+    mac = _gateway_mac(iface)
+    return f"gw:{mac}" if mac else ""
+
+
+def network_aliases(iface: str) -> set[str]:
+    """Every id this network may have been saved under in the trust list.
+
+    Older versions stored a WiFi network as "gw:<MAC>" whenever iwgetid was
+    missing, so a trusted network matches on either form.
+    """
+    aliases = set()
+    net_id = current_network_id(iface)
+    if net_id:
+        aliases.add(net_id)
+    mac = _gateway_mac(iface)
+    if mac:
+        aliases.add(f"gw:{mac}")
+    return aliases
+
+
+def link_epoch(iface: str) -> tuple | None:
+    """Changes exactly when `iface` joins a network afresh.
+
+    The kernel's carrier_changes counter moves on every cable replug and every
+    WiFi (re)association; the SSID catches a switch between networks that
+    happened between two reads. Detectors that learn a per-network baseline
+    (who the gateway is, which DHCP server answers) reset on a new epoch, so a
+    network switch is a new baseline — while the same address changing hands
+    on a link that never dropped is still reported, which is what ARP or DHCP
+    spoofing looks like. The network id cannot serve here: on a wired link it
+    *is* the gateway's MAC, so a spoofed gateway would look like a new network.
+    """
+    if not iface:
+        return None
+    try:
+        carrier = (Path("/sys/class/net") / iface / "carrier_changes").read_text().strip()
+    except Exception:
+        carrier = ""
+    ssid = ""
+    if is_wireless(iface):
+        ssid = wifi_link(iface)[0]
+        if not ssid:
+            return None     # not associated or unreadable: unknown, not "new"
+    return (carrier, ssid)
+
+
+def get_default_gateway(iface: str = "") -> str:
+    """The default gateway's IP on `iface` (or system-wide), "" if there is none.
+
+    Scoped to an interface where one is given, so a Docker or VPN adapter's own
+    default route is not mistaken for the LAN's.
+    """
+    try:
+        cmd = ["ip", "route", "show", "default"]
+        if iface:
+            cmd += ["dev", iface]
+        route = subprocess.check_output(
+            cmd, text=True, timeout=2, stderr=subprocess.DEVNULL)
+        m = re.search(r"default via (\S+)", route)
+        return m.group(1) if m else ""
+    except Exception:
+        return ""
 
 
 def get_interface_info(iface: str) -> InterfaceInfo:
@@ -159,14 +284,7 @@ def get_interface_info(iface: str) -> InterfaceInfo:
     except Exception:
         pass
 
-    try:
-        ssid = subprocess.check_output(
-            ["iwgetid", iface, "--raw"],
-            text=True, timeout=2, stderr=subprocess.DEVNULL,
-        ).strip()
-        info.ssid = ssid
-    except Exception:
-        pass
+    info.ssid, _bssid = wifi_link(iface)
 
     info.vpn_ifaces = get_active_vpn_interfaces()
     return info

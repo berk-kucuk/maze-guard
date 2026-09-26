@@ -185,8 +185,9 @@ async def test_tls_monitor():
     from maze.detection.tls_monitor import TLSMonitor
     m = TLSMonitor()
     try:
-        h = await asyncio.wait_for(
-            asyncio.to_thread(m._get_spki_hash, "github.com", 443), timeout=8)
+        p = await asyncio.wait_for(
+            asyncio.to_thread(m._probe, "github.com", 443), timeout=15)
+        h = p.spki if p is not None and p.trusted else ""
         if h:
             ok(f"github.com TLS cert hash: {h[:16]}…")
         else:

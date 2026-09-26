@@ -10,11 +10,29 @@ class ThreatLevel(Enum):
     DANGEROUS = "dangerous"
 
 
+_LEVEL_RANK = {"safe": 0, "suspicious": 1, "dangerous": 2}
+
+
+def escalate(current: ThreatLevel, incoming: ThreatLevel) -> ThreatLevel:
+    """The higher of two threat levels.
+
+    The displayed level must never be decided by whichever event happened to
+    arrive last: an attacker is blocked (DANGEROUS) and the reconnaissance
+    that follows reports back (SUSPICIOUS) seconds later, which would
+    otherwise downgrade the header while the block is still in force. Lowering
+    it is a deliberate act — the reset control.
+    """
+    return (incoming if _LEVEL_RANK.get(incoming.value, 0)
+            > _LEVEL_RANK.get(current.value, 0) else current)
+
+
 class EventType(Enum):
     ARP_SPOOF      = "arp_spoof"
+    IP_MOVED       = "ip_moved"          # an IP's MAC changed, old owner gone (lease reuse)
     ARP_SCAN       = "arp_scan"          # netdiscover-style L2 sweep
     ROGUE_AP       = "rogue_ap"
     ROGUE_DHCP     = "rogue_dhcp"        # unexpected DHCP server on the link
+    ROGUE_RA       = "rogue_ra"          # unexpected IPv6 router on the link
     DNS_SPOOF      = "dns_spoof"
     TLS_CHANGE     = "tls_change"
     SSL_STRIP      = "ssl_strip"
@@ -26,7 +44,8 @@ class EventType(Enum):
     UNKNOWN_PROCESS= "unknown_process"
     DNS_LEAK       = "dns_leak"
     PROFILE_CHANGED= "profile_changed"
-    DEVICE_FOUND   = "device_found"
+    DEVICE_FOUND   = "device_found"   # seen on the wire this session
+    DEVICE_NEW     = "device_new"      # never seen on THIS network before
     MODULE_TOGGLED = "module_toggled"
     ENGINE_READY   = "engine_ready"
     RECON_RESULT   = "recon_result"

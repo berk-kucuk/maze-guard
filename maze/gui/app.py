@@ -1,8 +1,19 @@
 import asyncio
+import os
 import sys
-import qasync
+# PyQt6 BEFORE qasync, and QT_API pinned. qasync picks its Qt binding at import
+# time: QT_API first, then whichever binding is already imported, then the first
+# one that imports in the order PyQt5, PyQt6, ... With python-pyqt5 on the
+# system (other KDE/Qt apps pull it in) an early `import qasync` bound it to
+# PyQt5, so QEventLoop drove a PyQt5 event loop while every widget, timer and
+# socket lived in PyQt6: _boot() never ran, no window and no tray icon ever
+# appeared, and the hung process still held the single-instance socket — so
+# every later launch "activated" it and exited silently. Maze Guard would not
+# open at all until the user logged out.
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+os.environ["QT_API"] = "pyqt6"
+import qasync
 from maze.gui.app_state import AppState
 from maze.gui.dashboard import Dashboard
 from maze.gui.privilege import connect_helper
@@ -11,6 +22,7 @@ from maze.core.engine import MazeEngine
 from maze.core.profile import Profile
 from maze.gui.icons import create_app_icon
 from maze.utils.config import load_config, save_config
+from maze.utils.logger import log
 
 
 # CLI flags that ask the app to start hidden in the tray (used by autostart).
@@ -46,6 +58,47 @@ def _resolve_startup_profile(cfg) -> Profile:
         return Profile(getattr(cfg, "profile", "home"))
     except ValueError:
         return Profile.HOME
+
+
+def _ask_first_run(cfg, state, parent) -> None:
+    """Ask the four questions a fresh install cannot answer for itself.
+
+    Never blocks a launch: a failure here (no display for a modal, a config
+    that cannot be written) leaves the application running with its defaults,
+    which is the same state it had before this dialog existed. Skipped entirely
+    when starting hidden — a wizard nobody can see would just be a window that
+    never opens.
+    """
+    if getattr(cfg, "first_run_done", False):
+        return
+    try:
+        from maze.gui.widgets.first_run import FirstRunDialog
+        from maze.utils.network_info import get_active_physical_interface
+
+        interfaces = []
+        detected = get_active_physical_interface()
+        for name in (cfg.interface, detected):
+            if name and name != "—" and name not in interfaces:
+                interfaces.append(name)
+        try:
+            from pathlib import Path
+            interfaces += sorted(
+                p.name for p in Path("/sys/class/net").iterdir()
+                if p.name not in interfaces and p.name != "lo")
+        except OSError:
+            pass
+
+        dialog = FirstRunDialog(state, cfg, interfaces, parent)
+        dialog.exec()
+        dialog.apply()
+        save_config(cfg)
+    except Exception as exc:
+        log.warning(f"first-run setup skipped: {exc}")
+        try:
+            cfg.first_run_done = True
+            save_config(cfg)
+        except Exception:
+            pass
 
 
 def run() -> None:
@@ -119,6 +172,7 @@ def run() -> None:
         # Autostart / background launch: stay in the tray, don't pop the window.
         if not start_hidden:
             window.show()
+            _ask_first_run(cfg, state, window)
         await engine.start()
 
         # Apply the startup profile so core protections run out of the box

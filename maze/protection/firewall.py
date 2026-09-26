@@ -10,6 +10,7 @@ from maze.utils.logger import log
 _LOG_CLAUSE = "log prefix=MAZE-BLOCK level=info limit value=3/m "
 
 _IPV6_HINT = re.compile(r'^[0-9a-fA-F:]+(?:/\d{1,3})?$')
+_MAC_RE = re.compile(r'^(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
 
 
 @dataclass
@@ -80,6 +81,18 @@ class FirewallManager:
                 f'{_LOG_CLAUSE if with_log else ""}drop')
 
     @staticmethod
+    def _mac_rule(mac: str, with_log: bool = True) -> str:
+        """A drop rule keyed on hardware address.
+
+        No family attribute: firewalld only requires one for address matches,
+        and a MAC is family-agnostic — which is the point. Blocking a host by
+        IPv4 address leaves its IPv6 address and its next DHCP lease untouched;
+        blocking the MAC covers every address that hardware uses on this link.
+        """
+        return (f'rule source mac={mac.lower()} '
+                f'{_LOG_CLAUSE if with_log else ""}drop')
+
+    @staticmethod
     def _port_rule(port: int, proto: str, with_log: bool = True) -> str:
         return (f'rule family=ipv4 port port={port} protocol={proto} '
                 f'{_LOG_CLAUSE if with_log else ""}drop')
@@ -132,6 +145,12 @@ class FirewallManager:
             self._state = FirewallState()
             return self._state
         raw = await self._helper.fw_state()
+        if raw is None:
+            # A transient failure, not an answer: keep showing the last known
+            # state rather than flipping the UI to "Unavailable" until the next
+            # poll — which asks again, since nothing was cached.
+            log.warning("firewall state read failed this time; keeping the last known state")
+            return self._state
         if not raw:
             # A helper daemon older than this GUI does not know fw_state. Rather
             # than report the firewall as missing — which would be a lie, and
@@ -230,6 +249,10 @@ class FirewallManager:
             for rule in (self._ip_rule(ip), self._ip_rule(ip, with_log=False)):
                 await self._fw_cmd(["--permanent", "--zone", self._zone,
                                     "--remove-rich-rule", rule])
+        for mac in rules.get("macs", []):
+            for rule in (self._mac_rule(mac), self._mac_rule(mac, with_log=False)):
+                await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                    "--remove-rich-rule", rule])
         for proto_key, proto in [("ports_tcp", "tcp"), ("ports_udp", "udp")]:
             for port in rules.get(proto_key, []):
                 for rule in (self._port_rule(port, proto),
@@ -260,6 +283,38 @@ class FirewallManager:
         if ok:
             await self._fw_cmd(["--reload"])
         return ok
+
+    async def block_mac(self, mac: str) -> bool:
+        if not _MAC_RE.match(mac or ""):
+            self._last_error = f"not a hardware address: {mac!r}"
+            return False
+        if not await self.ensure_init():
+            return False
+        ok = await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                 "--add-rich-rule", self._mac_rule(mac)])
+        if ok:
+            await self._fw_cmd(["--reload"])
+        return ok
+
+    async def unblock_mac(self, mac: str) -> bool:
+        if not _MAC_RE.match(mac or ""):
+            self._last_error = f"not a hardware address: {mac!r}"
+            return False
+        if not await self.ensure_init():
+            return False
+        ok = await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                 "--remove-rich-rule", self._mac_rule(mac)])
+        ok |= await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                  "--remove-rich-rule",
+                                  self._mac_rule(mac, with_log=False)])
+        if ok:
+            await self._fw_cmd(["--reload"])
+        return ok
+
+    async def blocked_macs(self) -> list[str]:
+        if not self._has_helper():
+            return []
+        return list((await self._helper.fw_list()).get("macs", []))
 
     async def block_port(self, port: int, proto: str = "tcp") -> bool:
         if not await self.ensure_init():

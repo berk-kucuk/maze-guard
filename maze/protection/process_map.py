@@ -4,6 +4,7 @@ import socket
 import struct
 from dataclasses import dataclass
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
+from maze.core.verify import FAIL, PASS, Verdict, WARN
 
 _SEEN_MAX = 2000   # prune seen-set when it exceeds this size
 
@@ -166,6 +167,46 @@ class ProcessNetworkMonitor:
         if self._task:
             self._task.cancel()
 
+    async def verify(self) -> Verdict:
+        """Take a real snapshot and report what it could and could not see.
+
+        The failure that matters here is invisible from inside: without the
+        privileged helper the scan silently covers only this user's processes,
+        so a root daemon phoning home is not missed — it is never looked at.
+        """
+        privileged = bool(self._helper and self._helper.is_connected())
+        try:
+            conns = await self.snapshot()
+        except Exception as exc:
+            return Verdict(FAIL, f"the connection scan failed: {exc}")
+        owners = len({c.pid for c in conns})
+        evidence = [f"{len(conns)} external connections from {owners} processes",
+                    f"{len(self._known)} known programs whitelisted"]
+        if conns:
+            sample = conns[0]
+            evidence.append(f"e.g. {sample.process} → {sample.remote_addr}")
+        if not privileged:
+            return Verdict(WARN,
+                           "the scan works, but without the privileged helper "
+                           "it sees only this user's processes — connections "
+                           "owned by root daemons are invisible", evidence)
+        if not conns:
+            return Verdict(WARN,
+                           "the scan works but found no external connection at "
+                           "all, which is unusual on a running desktop",
+                           evidence)
+        return Verdict(PASS,
+                       f"the scan sees every process on the host: "
+                       f"{len(conns)} external connections attributed",
+                       evidence)
+
+    def status_detail(self) -> str:
+        if self._helper and self._helper.is_connected():
+            return (f"every process on the host · {len(self._known)} known "
+                    f"programs whitelisted")
+        return ("no privileged helper — only this user's own processes are "
+                f"visible · {len(self._known)} known programs whitelisted")
+
     async def snapshot(self) -> list[Connection]:
         # With the privileged helper we get every process's connections
         # (including root daemons); an unprivileged /proc scan only sees the
@@ -248,7 +289,11 @@ class ProcessNetworkMonitor:
         return False
 
     async def _monitor(self) -> None:
-        seen: set[tuple] = set()
+        # Insertion-ordered, so pruning drops the oldest. Keyed on the process
+        # and the service it talks to, not the address: a browser or an
+        # updater talking to a CDN reaches a different IP almost every time,
+        # and one row per IP was a stream of identical alerts.
+        seen: dict[tuple, None] = {}
         while True:
             await asyncio.sleep(10)
             conns = await self.snapshot()
@@ -258,10 +303,10 @@ class ProcessNetworkMonitor:
                 if self._known and not self._is_known(conn):
                     if conn.remote_port in self._NORMAL_PORTS:
                         continue
-                    key = (conn.process, conn.remote_ip, conn.remote_port)
+                    key = (conn.process, conn.remote_port)
                     if key in seen:
                         continue
-                    seen.add(key)
+                    seen[key] = None
                     await self._bus.emit(Event(
                         type=EventType.UNKNOWN_PROCESS,
                         level=ThreatLevel.SUSPICIOUS,
@@ -271,6 +316,5 @@ class ProcessNetworkMonitor:
                               "remote": conn.remote_addr},
                     ))
             if len(seen) > _SEEN_MAX:
-                items = list(seen)
-                seen.clear()
-                seen.update(items[-_SEEN_MAX // 2:])
+                for old in list(seen)[:len(seen) - _SEEN_MAX // 2]:
+                    del seen[old]

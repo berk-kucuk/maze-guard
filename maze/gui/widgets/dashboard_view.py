@@ -206,7 +206,7 @@ class DashboardView(QWidget):
         state.language_changed.connect(self.retranslate)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(5000)
+        self._timer.setInterval(10000)
         self._timer.timeout.connect(self.refresh)
         self._timer.start()
 
@@ -289,12 +289,25 @@ class DashboardView(QWidget):
     # ── refresh ───────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
+        # Not while hidden (tray, or another tab): this spawns firewall-cmd,
+        # iw and ip on every tick. showEvent refreshes when we come back.
+        if not self.isVisible():
+            return
         self._refresh_network()
         asyncio.ensure_future(self._refresh_firewall())
         self._refresh_ports()
         self._refresh_scan()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # The byte counters kept moving while we were hidden — a delta across
+        # that gap would show as one absurd burst.
+        self._bw_prev = None
+        self.refresh()
+
     def _update_bandwidth(self) -> None:
+        if not self.isVisible():
+            return
         iface = self._cfg.interface
         curr = _read_iface_bytes(iface)
         if curr is None:

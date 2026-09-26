@@ -11,8 +11,8 @@
 #   source=("$pkgname-$pkgver.tar.gz::https://github.com/berk-kucuk/maze-guard/archive/refs/tags/v$pkgver.tar.gz")
 
 pkgname=maze-guard
-pkgver=2.9.0
-pkgrel=1
+pkgver=2.19.0
+pkgrel=7
 pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration"
 arch=('x86_64' 'aarch64')
 url="https://github.com/berk-kucuk/maze-guard"
@@ -21,15 +21,14 @@ license=('MIT')
 replaces=('maze')
 conflicts=('maze')
 
-# Python packages are installed into an isolated venv at /opt/maze-guard/venv
-# (NOT into the system Python) — see maze-guard.install for post_install details.
+# Python libraries come from maze-python, the shared Maze venv at
+# /opt/maze/venv (PyQt6, scapy, httpx, qasync, cryptography, python-dbus).
+# This package ships only its own code and runs it with that interpreter.
 depends=(
-    'python>=3.11'     # interpreter only; libs go in venv
-    'python-dbus'      # linked into venv (avoids dbus-python compile)
+    'maze-python'      # shared Python runtime: /opt/maze/venv
     'firewalld'        # firewall backend (rich rules)
     'iproute2'         # ip route / ip neigh commands
     'dbus'             # dbus daemon (runtime)
-    'libdbus'          # shared library for dbus-python
     'polkit'           # consent prompt before any protection can be turned off
     'systemd'          # runs the privileged helper as a daemon (maze-guard.service)
 )
@@ -37,7 +36,13 @@ makedepends=(
     'imagemagick'      # resize app icon to multiple sizes during build
 )
 optdepends=(
-    'wireless_tools: WiFi/rogue-AP monitoring (iwgetid)'
+    # Reading the current access point needs ONE of iw, iwgetid or nmcli.
+    # iw ships with the kernel's wireless stack and nmcli with NetworkManager,
+    # so on a machine that can join WiFi at all one of them is already there;
+    # wireless_tools is only listed for hosts that have neither.
+    'iw: read the current access point for rogue-AP detection'
+    'networkmanager: alternative access-point reader (nmcli)'
+    'wireless_tools: legacy access-point reader (iwgetid)'
 )
 install=maze-guard.install
 
@@ -50,19 +55,22 @@ package() {
     # ── Application source → /opt/maze-guard ────────────────────────────────────
     install -dm755 "$pkgdir/opt/maze-guard"
     cp -r maze main.py "$pkgdir/opt/maze-guard/"
+    # main.py and maze/helper.py are entry points and must be executable. The
+    # .install scriptlet used to chmod them to 755 AFTER pacman had recorded
+    # them as 644, so the package permanently disagreed with the disk and every
+    # `pacman -Qkk` reported a permissions mismatch. Ship the real modes here
+    # instead, and let the database be right.
+    chmod 755 "$pkgdir/opt/maze-guard/main.py" "$pkgdir/opt/maze-guard/maze/helper.py"
     [[ -f pyproject.toml   ]] && install -m644 pyproject.toml   "$pkgdir/opt/maze-guard/"
     [[ -f requirements.txt ]] && install -m644 requirements.txt "$pkgdir/opt/maze-guard/"
     [[ -d assets ]] && cp -r assets "$pkgdir/opt/maze-guard/"
     [[ -f MAZE.png ]] && install -m644 MAZE.png "$pkgdir/opt/maze-guard/"
 
-    # Placeholder venv dir — populated in post_install
-    install -dm755 "$pkgdir/opt/maze-guard/venv"
-
     # ── Launcher → /usr/bin/maze-guard ───────────────────────────────────────────
     install -dm755 "$pkgdir/usr/bin"
     install -m755 /dev/stdin "$pkgdir/usr/bin/maze-guard" << 'LAUNCHER'
 #!/usr/bin/env bash
-exec /opt/maze-guard/venv/bin/python3 /opt/maze-guard/main.py "$@"
+exec /opt/maze/venv/bin/python3 /opt/maze-guard/main.py "$@"
 LAUNCHER
 
     # ── Privileged helper daemon (systemd) ─────────────────────────────────
@@ -76,9 +84,13 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/opt/maze-guard/venv/bin/python3 /opt/maze-guard/maze/helper.py
+ExecStart=/opt/maze/venv/bin/python3 /opt/maze-guard/maze/helper.py
 Restart=on-failure
 RestartSec=2
+# The helper exits within a second of SIGTERM; anything longer is a wedge
+# (a torn-down environment under a running process, a stuck sniff thread) and
+# not worth systemd's 90 s default — it stalls every shutdown and upgrade.
+TimeoutStopSec=10
 # NO RuntimeDirectory=maze here. /run/maze is SHARED: maze-tools' maze-guardd
 # binds /run/maze/guard.sock in it, and Maze Sentinel writes state files there.
 # RuntimeDirectory makes systemd DELETE the whole directory when this unit stops,
@@ -99,6 +111,24 @@ ProtectHostname=true
 NoNewPrivileges=true
 RestrictSUIDSGID=true
 LockPersonality=true
+# Sandbox (2026-09). Everything below leaves what the helper really does intact
+# — sniffing (AF_PACKET), sysctl writes (so no ProtectKernelTunables), firewalld
+# and systemd over D-Bus, polkit — and takes away what it never needs: loading
+# kernel modules, the clock, realtime scheduling, new namespaces, foreign-ABI
+# syscalls, raw devices, and every syscall outside the normal service set
+# (answered with EPERM, not a kill, so a surprise shows up as an error in the
+# journal instead of a dead helper). Verify on a machine: sudo maze-sandbox-check
+# Relax one directive locally if ever needed: sudo systemctl edit maze-guard
+PrivateTmp=true
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelModules=true
+RestrictRealtime=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 
 [Install]
 WantedBy=multi-user.target

@@ -52,10 +52,16 @@ _TOOLS = [
     ("systemctl",    FAIL, "systemd — required to control the firewall service"),
     ("ip",           FAIL, "iproute2 — required for interface and neighbour data"),
     ("pkcheck",      FAIL, "polkit — required to authorise turning protections off"),
-    ("iwgetid",      WARN, "wireless_tools — without it, rogue-AP detection is blind"),
     ("ss",           WARN, "iproute2 ss — used for the open-ports table"),
     ("ping",         WARN, "iputils — used for the OS/latency hint during recon"),
 ]
+
+
+# Reading the current access point needs one of these, not a particular one.
+# Requiring iwgetid specifically was wrong: it ships in wireless-tools, which
+# most distributions no longer install, while `iw` and `nmcli` are present on
+# anything that can join a WiFi network.
+_AP_TOOLS = ("iw", "iwgetid", "nmcli")
 
 
 def _check_tools(report: Report) -> None:
@@ -64,6 +70,10 @@ def _check_tools(report: Report) -> None:
             report.add("Environment", tool, OK)
         else:
             report.add("Environment", tool, severity, f"not found — {why}")
+    found = [t for t in _AP_TOOLS if shutil.which(t)]
+    report.add("Environment", "access-point reader", OK if found else WARN,
+               ", ".join(found) if found else
+               "none of iw/iwgetid/nmcli found — evil-twin detection is blind")
 
 
 def _check_python_deps(report: Report) -> None:
@@ -122,10 +132,27 @@ async def _check_helper(report: Report) -> object | None:
     if state:
         report.add("Privileged helper", "up to date", OK,
                    "supports fw_state / fw_service")
+    elif state is None:
+        report.add("Privileged helper", "up to date", WARN,
+                   "the helper is current but could not read the firewall state "
+                   "just now — details: journalctl -u maze-guard.service -e")
     else:
         report.add("Privileged helper", "up to date", FAIL,
                    "the running daemon predates this GUI — restart it: "
                    "sudo systemctl restart maze-guard.service")
+
+    # The capture filter and the sysctl allowlist live inside the daemon, so a
+    # daemon started before this version was installed still runs the old ones.
+    # That is invisible from the outside — DNS leak detection simply never
+    # fires — unless something asks. This asks.
+    probe = await client.sysctl_get("net.ipv4.tcp_timestamps")
+    report.add("Privileged helper", "current capture + tuning surface",
+               OK if probe is not None else WARN,
+               "live DNS capture and fingerprint keys available"
+               if probe is not None else
+               "the running daemon is older than this build: live DNS leak "
+               "detection and timestamp hiding are inactive until you run "
+               "sudo systemctl restart maze-guard.service")
     return client
 
 
@@ -247,11 +274,18 @@ async def _check_tls(report: Report) -> None:
     monitor = TLSMonitor()
     for host in _CANARY_HOSTS:
         try:
-            digest = await asyncio.wait_for(
-                asyncio.to_thread(monitor._get_spki_hash, host, 443), timeout=10)
-            report.add("TLS", f"canary: {host}", OK if digest else WARN,
-                       f"spki={digest[:16]}…" if digest
-                       else "no certificate — offline, or 443 is blocked")
+            probe = await asyncio.wait_for(
+                asyncio.to_thread(monitor._probe, host, 443), timeout=15)
+            if probe is None:
+                report.add("TLS", f"canary: {host}", WARN,
+                           "no certificate — offline, or 443 is blocked")
+            elif probe.trusted:
+                report.add("TLS", f"canary: {host}", OK,
+                           f"trusted chain, spki={probe.spki[:16]}…")
+            else:
+                report.add("TLS", f"canary: {host}", FAIL,
+                           f"untrusted certificate (issuer: "
+                           f"{probe.issuer or 'unknown'}) — {probe.reason}")
         except Exception as exc:
             report.add("TLS", f"canary: {host}", WARN, str(exc))
 
@@ -271,17 +305,23 @@ async def _check_recon(report: Report, cfg) -> None:
 
 
 async def _check_modules(report: Report, cfg, client) -> None:
-    """Start every module, then stop it, and report which ones refuse."""
+    """Start every module, run its self-test, then stop it again."""
     from maze.core.engine import MazeEngine
     engine = MazeEngine(cfg, helper=client)
     for key in sorted(engine._modules):
         module = engine._modules[key]
         try:
             await engine._start_module(key)
-            if key in engine._active:
-                report.add("Modules", key, OK)
-            else:
-                report.add("Modules", key, FAIL, "start() did not take effect")
+            if key not in engine._active:
+                report.add("Modules", key, FAIL,
+                           engine.module_error(key) or "start() did not take effect")
+                continue
+            # "it started" is the weakest claim a security module can make. Run
+            # the same self-test the Protection tab's Test button runs, so the
+            # terminal and the interface cannot disagree about what is true.
+            verdict = await engine.verify_module(key)
+            report.add("Modules", key, _STATUS_OF.get(verdict.status, WARN),
+                       verdict.as_text().replace("\n", "\n         "))
         except Exception as exc:
             report.add("Modules", key, FAIL, str(exc))
         finally:
@@ -292,11 +332,17 @@ async def _check_modules(report: Report, cfg, client) -> None:
         del module
 
 
+# A self-test verdict maps straight onto a report line: the two vocabularies
+# were built for the same purpose, one for the interface and one for the
+# terminal.
+_STATUS_OF = {"pass": OK, "info": OK, "warn": WARN, "fail": FAIL, "na": SKIP}
+
+
 def _check_storage(report: Report) -> None:
-    from maze.core.incident import DATA_DIR
+    from maze.core.incident import default_data_dir
     from maze.utils.config import CONFIG_PATH
     for label, path in (("config", CONFIG_PATH.parent),
-                        ("incident records", DATA_DIR)):
+                        ("incident records", default_data_dir())):
         try:
             path.mkdir(parents=True, exist_ok=True)
             probe = path / ".maze-doctor-probe"

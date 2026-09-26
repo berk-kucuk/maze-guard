@@ -20,6 +20,8 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 
+from maze.utils.ipaddr import is_ipv6
+
 _LLADDR_RE = re.compile(r'lladdr\s+([0-9a-f:]{17})')
 _TITLE_RE  = re.compile(r'<title[^>]*>(.*?)</title>', re.I | re.S)
 
@@ -46,6 +48,9 @@ _COMMON_PORTS = [
     2049, 6881, 8384, 9091,
     # Mobile
     5555, 62078,
+    # Cameras, printers, media and home automation — the devices an inventory
+    # is usually about, and the ones nothing else on this list would identify
+    554, 8554, 9100, 5357, 8009, 8123, 32400, 49152,
     # Commonly associated with offensive tooling or backdoors
     1080, 1337, 4444, 4445, 5554, 6667, 9001, 9050, 12345, 31337,
 ]
@@ -73,7 +78,51 @@ _PORT_NAMES = {
     9091: "Transmission", 9200: "Elasticsearch", 11211: "Memcached",
     12345: "NetBus?", 27017: "MongoDB", 31337: "Back Orifice?",
     47808: "BACnet", 62078: "iOS/lockdownd",
+    554: "RTSP", 8554: "RTSP-alt", 9100: "JetDirect/printer",
+    5357: "WSDAPI", 8009: "Chromecast", 8123: "Home Assistant",
+    32400: "Plex", 49152: "UPnP/HTTP",
 }
+
+# ── scan profiles ─────────────────────────────────────────────────────────────
+# One dossier is not one size. A quick look at a neighbour and a full audit of
+# a device you are suspicious of want different budgets, and picking for the
+# user means always being wrong for one of them.
+
+_QUICK_PORTS = (
+    21, 22, 23, 25, 53, 80, 135, 139, 443, 445, 554, 631, 993, 995,
+    1883, 3306, 3389, 5000, 5555, 5900, 8080, 8443, 8888, 9100, 62078,
+)
+
+# 1–1024 covers the assigned range; the extras are the high ports that
+# actually matter (databases, dev servers, remote access, known backdoors).
+_THOROUGH_PORTS = tuple(sorted(set(range(1, 1025)) | set(_COMMON_PORTS)))
+
+
+@dataclass(frozen=True)
+class ScanProfile:
+    """How wide and how patient one sweep is allowed to be."""
+    name: str
+    ports: tuple
+    port_timeout: float
+    budget: float
+    deep: bool = True          # follow up with banners / TLS / UPnP
+
+    @property
+    def port_count(self) -> int:
+        return len(self.ports)
+
+
+SCAN_PROFILES: dict[str, ScanProfile] = {
+    "quick":    ScanProfile("quick", tuple(_QUICK_PORTS), 0.6, 8.0, deep=False),
+    "standard": ScanProfile("standard", tuple(_COMMON_PORTS), 1.5, _SWEEP_BUDGET),
+    "thorough": ScanProfile("thorough", _THOROUGH_PORTS, 0.8, 120.0),
+}
+DEFAULT_PROFILE = "standard"
+
+
+def get_profile(name: str) -> ScanProfile:
+    return SCAN_PROFILES.get(name or DEFAULT_PROFILE,
+                             SCAN_PROFILES[DEFAULT_PROFILE])
 
 # Ports that say something about intent rather than function. Weight is the
 # contribution to the risk score.
@@ -94,6 +143,7 @@ _RISK_PORTS: dict[int, tuple[int, str]] = {
     11211: (15, "Memcached — amplification source"),
     5555:  (10, "Android debug bridge open"),
     6000:  (10, "X11 open to the network"),
+    554:   (10, "RTSP stream reachable — a camera feed anyone can try"),
 }
 
 # OUI prefix → vendor. Keys: uppercase hex, no colons, 6 chars (or 4 for
@@ -162,10 +212,17 @@ class ReconResult:
     randomized_mac: bool = False
     risk_score: int = 0
     findings: list[str] = field(default_factory=list)
+    upnp: dict = field(default_factory=dict)
+    device_kind: str = ""
+    profile: str = DEFAULT_PROFILE
+    ports_scanned: int = 0
+    duration_s: float = 0.0
+    partial: bool = False        # sweep hit its budget before finishing
 
     @property
     def name(self) -> str:
-        return self.netbios_name or self.mdns_name or self.hostname
+        return (self.netbios_name or self.mdns_name or self.hostname
+                or self.upnp.get("friendly_name", ""))
 
     def to_dict(self) -> dict:
         return {
@@ -178,26 +235,52 @@ class ReconResult:
             "latency_ms": self.latency_ms,
             "randomized_mac": self.randomized_mac,
             "risk_score": self.risk_score, "findings": self.findings,
+            "upnp": self.upnp, "device_kind": self.device_kind,
+            "profile": self.profile, "ports_scanned": self.ports_scanned,
+            "duration_s": self.duration_s, "partial": self.partial,
         }
 
 
-async def recon_ip(ip: str, port_timeout: float = 1.5) -> ReconResult:
-    result = ReconResult(ip=ip)
+async def recon_ip(ip: str, port_timeout: float | None = None,
+                   profile: str = DEFAULT_PROFILE,
+                   on_progress=None) -> ReconResult:
+    """Build a dossier on one on-link host.
 
-    hostname, ports, ping, mac, netbios, mdns = await asyncio.gather(
+    ``profile`` selects how wide the sweep goes (see SCAN_PROFILES);
+    ``port_timeout`` overrides the profile's per-port patience when given.
+    ``on_progress(stage, done, total)`` is called as work completes — the UI
+    uses it to show what is happening instead of an opaque spinner.
+    """
+    prof = get_profile(profile)
+    timeout = port_timeout if port_timeout is not None else prof.port_timeout
+    started = time.monotonic()
+    result = ReconResult(ip=ip, profile=prof.name, ports_scanned=prof.port_count)
+
+    def progress(stage: str, done: int = 0, total: int = 0) -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress(stage, done, total)
+        except Exception:      # a broken UI callback must not fail a scan
+            pass
+
+    progress("identity", 0, 1)
+    hostname, ports, ping, mac, netbios, mdns, upnp = await asyncio.gather(
         _reverse_dns(ip),
-        _scan_ports(ip, port_timeout),
+        _scan_ports(ip, timeout, prof, progress),
         _ping(ip),
         _get_mac(ip),
         _netbios_query(ip),
         _mdns_query(ip),
+        _upnp_probe(ip) if prof.deep else _nothing(),
         return_exceptions=True,
     )
 
     if isinstance(hostname, str):
         result.hostname = hostname
-    if isinstance(ports, list):
-        result.open_ports = ports
+    tcp_rtt = 0.0
+    if isinstance(ports, tuple):
+        result.open_ports, result.partial, tcp_rtt = ports
     if isinstance(mac, str) and mac:
         result.mac = mac
         result.vendor = _oui_lookup(mac)
@@ -206,19 +289,37 @@ async def recon_ip(ip: str, port_timeout: float = 1.5) -> ReconResult:
         result.netbios_name = netbios
     if isinstance(mdns, str) and mdns:
         result.mdns_name = mdns
+    if isinstance(upnp, dict) and upnp:
+        result.upnp = upnp
+        if not result.vendor and upnp.get("manufacturer"):
+            result.vendor = upnp["manufacturer"][:40]
 
     ttl_hint = ""
     if isinstance(ping, tuple):
         ttl_hint, result.latency_ms = ping
+    if not result.latency_ms and tcp_rtt:
+        # ICMP is routinely filtered, and the ping subprocess can time out
+        # under a heavy sweep. Reporting "0.0 ms" for a host we just completed
+        # a TCP handshake with is worse than reporting the handshake.
+        result.latency_ms = tcp_rtt
 
     port_nums = {p for p, _ in result.open_ports}
     result.os_hint = _enrich_os(ttl_hint, port_nums)
 
     # Second pass: talk to whatever answered, to learn what it is.
-    await _fingerprint_services(ip, result, port_nums)
+    if prof.deep:
+        progress("services", 0, len(port_nums))
+        await _fingerprint_services(ip, result, port_nums)
 
+    result.device_kind = _classify_device(result, port_nums)
     _assess_risk(result, port_nums)
+    result.duration_s = round(time.monotonic() - started, 1)
+    progress("done", 1, 1)
     return result
+
+
+async def _nothing() -> dict:
+    return {}
 
 
 # ── service fingerprinting ────────────────────────────────────────────────────
@@ -228,8 +329,9 @@ async def _fingerprint_services(ip: str, result: ReconResult,
     """Grab banners, HTTP identity and TLS certificate details in parallel."""
     banner_ports = sorted(port_nums & {21, 22, 23, 25, 110, 143, 143, 587,
                                        6379, 11211, 6667})
-    http_ports = sorted(port_nums & {80, 3000, 4200, 5173, 8000, 8008, 8080,
-                                     8081, 8088, 8888, 9090})
+    http_ports = sorted(port_nums & {80, 3000, 4200, 5000, 5173, 5357, 8000,
+                                     8008, 8080, 8081, 8088, 8123, 8888,
+                                     9090, 32400, 49152})
     tls_ports = sorted(port_nums & {443, 8443, 465, 993, 995, 636, 8883})
 
     jobs = (
@@ -468,7 +570,13 @@ def _enrich_os(base: str, port_nums: set[int]) -> str:
 # ── name resolution ───────────────────────────────────────────────────────────
 
 async def _netbios_query(ip: str, timeout: float = 1.5) -> str:
-    """Query NetBIOS Name Service (UDP 137) for the Windows machine name."""
+    """Query NetBIOS Name Service (UDP 137) for the Windows machine name.
+
+    IPv4 only, and not by omission: NetBIOS over TCP/IP was never given a v6
+    form, so a v6 target has no answer to give.
+    """
+    if is_ipv6(ip):
+        return ""
     pkt = (
         b'\xab\xcd'          # Transaction ID
         b'\x00\x00'          # Flags: request
@@ -520,7 +628,14 @@ async def _mdns_query(ip: str, timeout: float = 2.0) -> str:
     Apple, Android and Linux devices answer this where NetBIOS gets nothing,
     and the answer is the name the owner actually chose ("berk-macbook"),
     which is far more identifying than an IP.
+
+    The reverse name is built from four octets, so this asks nothing of a v6
+    address; the ip6.arpa form exists but the unicast trick this relies on does
+    not carry over cleanly, and claiming a v6 lookup that never answers would
+    just add two seconds to every scan.
     """
+    if is_ipv6(ip):
+        return ""
     def _query() -> str:
         try:
             octets = ip.split(".")
@@ -612,9 +727,15 @@ async def _reverse_dns(ip: str) -> str:
 # ── layer 2 ───────────────────────────────────────────────────────────────────
 
 async def _get_mac(ip: str) -> str:
+    # `ip neigh` wants the address without a zone index: "fe80::1%wlan0" is how
+    # sockets name a link-local peer, but the neighbour table is already
+    # per-interface and rejects the suffix outright.
+    target = ip.split("%", 1)[0]
     try:
         out = await asyncio.to_thread(
-            subprocess.check_output, ["ip", "neigh", "show", ip], text=True
+            lambda: subprocess.check_output(
+                ["ip", "neigh", "show", target], text=True,
+                stderr=subprocess.DEVNULL, timeout=3)
         )
         m = _LLADDR_RE.search(out)
         return m.group(1) if m else ""
@@ -636,26 +757,179 @@ def _is_randomized(mac: str) -> bool:
 
 # ── port sweep ────────────────────────────────────────────────────────────────
 
-async def _scan_ports(ip: str, timeout: float) -> list[tuple[int, str]]:
+async def _scan_ports(ip: str, timeout: float, prof: "ScanProfile",
+                      progress=None) -> tuple[list[tuple[int, str]], bool, float]:
+    """Sweep the profile's ports. Returns (open ports, hit_the_budget, rtt).
+
+    Results accumulate as probes land rather than being assembled at the end:
+    the sweep is time-boxed, and the previous version answered "no open ports"
+    for every host slow enough to exhaust the box — the worst possible answer,
+    because it is indistinguishable from a clean one.
+    """
     sem = asyncio.Semaphore(_MAX_CONCURRENT_PROBES)
+    found: list[tuple[int, str]] = []
+    state = {"done": 0, "rtt": 0.0}
+    total = len(prof.ports)
+    step = max(1, total // 40)      # ~40 progress ticks over the whole sweep
 
-    async def probe(port: int) -> bool:
+    async def probe(port: int) -> None:
         async with sem:
-            return await _check_port(ip, port, timeout)
+            started = time.monotonic()
+            is_open = await _check_port(ip, port, timeout)
+        if is_open:
+            found.append((port, _PORT_NAMES.get(port, "?")))
+            # A completed handshake times the path as well as ICMP does, and
+            # unlike ICMP it cannot be filtered without also closing the port.
+            elapsed = (time.monotonic() - started) * 1000
+            if state["rtt"] == 0.0 or elapsed < state["rtt"]:
+                state["rtt"] = round(elapsed, 2)
+        state["done"] += 1
+        if progress and (state["done"] % step == 0 or state["done"] == total):
+            progress("ports", state["done"], total)
 
+    tasks = [asyncio.create_task(probe(p)) for p in prof.ports]
+    _, pending = await asyncio.wait(tasks, timeout=prof.budget)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    return sorted(found), bool(pending), state["rtt"]
+
+
+# ── UPnP / SSDP identity ──────────────────────────────────────────────────────
+
+_SSDP_MSEARCH = (
+    b"M-SEARCH * HTTP/1.1\r\n"
+    b"HOST: 239.255.255.250:1900\r\n"
+    b'MAN: "ssdp:discover"\r\n'
+    b"MX: 1\r\n"
+    b"ST: upnp:rootdevice\r\n\r\n"
+)
+_LOCATION_RE = re.compile(rb"location:\s*(\S+)", re.I)
+_UPNP_FIELDS = {
+    "friendly_name":     re.compile(r"<friendlyName>(.*?)</friendlyName>", re.I | re.S),
+    "manufacturer":      re.compile(r"<manufacturer>(.*?)</manufacturer>", re.I | re.S),
+    "model_name":        re.compile(r"<modelName>(.*?)</modelName>", re.I | re.S),
+    "model_description": re.compile(r"<modelDescription>(.*?)</modelDescription>", re.I | re.S),
+}
+
+
+async def _upnp_probe(ip: str, timeout: float = 2.5) -> dict:
+    """Ask a host to describe itself over UPnP.
+
+    Routers, TVs, printers, consoles, NAS boxes and most smart-home hardware
+    answer a unicast M-SEARCH with a description URL, and that description
+    carries the manufacturer and model — the one identity source that names a
+    device the way its owner would. Costs one UDP packet and one HTTP GET.
+
+    IPv4 only: the v6 SSDP form exists but is rarely implemented, and the
+    socket here is AF_INET.
+    """
+    if is_ipv6(ip):
+        return {}
+    location = await asyncio.wait_for(
+        asyncio.to_thread(_ssdp_location, ip), timeout=timeout + 1)
+    if not location:
+        return {}
+    # Only ever fetch from the host we are profiling. LOCATION is attacker
+    # controlled: a device that points it at some third party must not turn
+    # this into a request we make on its behalf.
+    host, port, path = _split_url(location)
+    if host != ip:
+        return {}
+    xml = await _http_get(ip, port, path, timeout)
+    if not xml:
+        return {}
+    out = {}
+    for key, pattern in _UPNP_FIELDS.items():
+        m = pattern.search(xml)
+        if m:
+            value = re.sub(r"\s+", " ", m.group(1)).strip()[:80]
+            if value:
+                out[key] = value
+    return out
+
+
+def _ssdp_location(ip: str) -> str:
     try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*[probe(p) for p in _COMMON_PORTS],
-                           return_exceptions=True),
-            timeout=_SWEEP_BUDGET,
-        )
-    except asyncio.TimeoutError:
-        return []
-    return [
-        (p, _PORT_NAMES.get(p, "?"))
-        for p, r in zip(_COMMON_PORTS, results)
-        if r is True
-    ]
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2.0)
+        sock.sendto(_SSDP_MSEARCH, (ip, 1900))
+        data, _ = sock.recvfrom(2048)
+        sock.close()
+        m = _LOCATION_RE.search(data)
+        return m.group(1).decode(errors="replace") if m else ""
+    except Exception:
+        return ""
+
+
+def _split_url(url: str) -> tuple[str, int, str]:
+    m = re.match(r"https?://\[?([^\]/:]+)\]?(?::(\d+))?(/.*)?$", url.strip())
+    if not m:
+        return "", 0, ""
+    return m.group(1), int(m.group(2) or 80), m.group(3) or "/"
+
+
+async def _http_get(ip: str, port: int, path: str, timeout: float) -> str:
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port), timeout=timeout)
+    except Exception:
+        return ""
+    try:
+        writer.write(f"GET {path} HTTP/1.1\r\nHost: {ip}\r\n"
+                     f"User-Agent: Maze-Guard\r\nConnection: close\r\n\r\n"
+                     .encode())
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(16384), timeout=timeout)
+        return data.decode(errors="replace")
+    except Exception:
+        return ""
+    finally:
+        await _close(writer)
+
+
+# ── device classification ─────────────────────────────────────────────────────
+
+def _classify_device(result: ReconResult, port_nums: set[int]) -> str:
+    """What kind of thing this is, in the words someone would use out loud.
+
+    An inventory that says "Linux / Unix" for the printer, the camera and the
+    router is technically right and practically useless.
+    """
+    text = " ".join([
+        result.upnp.get("model_description", ""),
+        result.upnp.get("model_name", ""),
+        result.upnp.get("friendly_name", ""),
+        result.vendor,
+    ]).lower()
+
+    # 9100/515 are printers and nothing else. CUPS (631) is NOT a printer
+    # signal on its own — it ships on every Linux desktop, and treating it as
+    # one labelled ordinary workstations "Printer".
+    if port_nums & {9100, 515} or "printer" in text:
+        return "Printer"
+    if port_nums & {554, 8554} or "camera" in text or "ipcam" in text:
+        return "IP camera"
+    if port_nums & {102, 502, 47808}:
+        return "Industrial controller"
+    if "router" in text or "gateway" in text or "internet gateway device" in text:
+        return "Router / gateway"
+    if port_nums & {8009, 32400} or "tv" in text or "media" in text:
+        return "Media device / TV"
+    if port_nums & {2049, 548, 5000} and port_nums & {80, 443, 5001}:
+        return "NAS / file server"
+    if port_nums & {5555, 62078} or result.os_hint.startswith(("Android", "iOS")):
+        return "Mobile device"
+    if port_nums & {1883, 8883, 8123} or "esp" in text or "iot" in text:
+        return "IoT / smart home"
+    if port_nums & {3389, 445, 135}:
+        return "Workstation / server"
+    if result.os_hint in ("Router / Embedded device", "Network device"):
+        return "Network device"
+    if port_nums & {22, 3306, 5432, 27017, 6379}:
+        return "Server / workstation"
+    return ""
 
 
 async def _check_port(ip: str, port: int, timeout: float) -> bool:
@@ -714,6 +988,12 @@ def format_recon(result: ReconResult) -> str:
         parts.append(f"mac={mac_str}")
     if result.name:
         parts.append(f"hostname={result.name}")
+    if result.device_kind:
+        parts.append(f"kind={result.device_kind}")
+    model = " ".join(x for x in (result.upnp.get("manufacturer", ""),
+                                 result.upnp.get("model_name", "")) if x)
+    if model:
+        parts.append(f"model={model}")
     if result.os_hint:
         parts.append(f"os={result.os_hint}")
     if result.latency_ms:
@@ -728,4 +1008,6 @@ def format_recon(result: ReconResult) -> str:
         parts.append(f"risk={result.risk_score}/100")
     if result.findings:
         parts.append(f"findings=[{'; '.join(result.findings[:3])}]")
+    if result.partial:
+        parts.append("sweep=partial (budget reached)")
     return " | ".join(parts)

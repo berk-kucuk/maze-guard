@@ -3,11 +3,13 @@ import csv
 import re
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMenu, QPushButton, QLineEdit, QFileDialog,
+    QHeaderView, QMenu, QPushButton, QLineEdit, QFileDialog, QSplitter,
+    QTextEdit,
 )
 from PyQt6.QtGui import QColor
 from PyQt6.QtCore import Qt
 from maze.core.events import Event, ThreatLevel
+from maze.core.explain import explain
 from maze.gui.theme import THREAT_COLORS
 
 _IP_RE   = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
@@ -43,7 +45,21 @@ class EventListWidget(QWidget):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._table.customContextMenuRequested.connect(self._show_context_menu)
-        layout.addWidget(self._table)
+        self._table.itemSelectionChanged.connect(self._on_select)
+
+        # A detection nobody can act on has done half a job. Selecting a row
+        # says what the observation means and what to do about it, in the same
+        # language as the rest of the interface.
+        self._explain = QTextEdit()
+        self._explain.setReadOnly(True)
+        self._explain.setStyleSheet("font-size: 12px;")
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setHandleWidth(6)
+        splitter.addWidget(self._table)
+        splitter.addWidget(self._explain)
+        splitter.setSizes([520, 190])
+        layout.addWidget(splitter)
 
         state.language_changed.connect(self.retranslate)
         self.retranslate()
@@ -124,6 +140,19 @@ class EventListWidget(QWidget):
     def _clear_events(self) -> None:
         self._table.setRowCount(0)
         self._all_events.clear()
+        self._explain.clear()
+
+    def _event_at(self, row: int) -> Event | None:
+        for event, index in self._all_events:
+            if index == row:
+                return event
+        return None
+
+    def _on_select(self) -> None:
+        rows = self._table.selectionModel().selectedRows()
+        event = self._event_at(rows[0].row()) if rows else None
+        self._explain.setPlainText(
+            explain(event, self._state.t) if event else "")
 
     def _export_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(

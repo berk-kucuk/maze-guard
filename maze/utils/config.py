@@ -39,7 +39,16 @@ class MazeConfig:
     theme: str = "dark"
     language: str = "en"
     profile: str = "home"
-    auto_profile_switch: bool = False
+    # Switch profile by network: a network on trusted_networks gets HOME,
+    # anything else PUBLIC. On by default, because the alternative — a fresh
+    # install sitting on "home" in every café until someone finds the combo —
+    # is the wrong failure mode for a tool whose job is exactly that
+    # judgement. Until the user marks a network trusted, every network is
+    # public; the tray says so once per switch so the choice is visible.
+    auto_profile_switch: bool = True
+    # Bumped when a default changes in a way existing config files should
+    # adopt. load_config() applies the migrations for anything older.
+    config_version: int = 2
     # Lowest threat level allowed to raise a DESKTOP (tray) notification.
     # "dangerous" (default) | "suspicious" | "off"
     #
@@ -52,11 +61,28 @@ class MazeConfig:
     # to dismiss, which is worse than not showing them. Real, confirmed threats
     # (ARP spoofing, a sustained scan) are DANGEROUS and still pop up.
     notify_min_level: str = "dangerous"
+    # Whether a device that has never been seen on THIS network raises a
+    # desktop notification. Separate from notify_min_level because it answers a
+    # different question — not "is something attacking me" but "is something
+    # here that shouldn't be" — and it is the signal a home user most wants.
+    notify_new_devices: bool = True
+    # Whether blocking a source also blocks its hardware address. An IP block
+    # is walked around by a DHCP renewal; a MAC block is not. Only meaningful
+    # on the local segment — which is the only place this tool ever blocks.
+    block_by_mac: bool = True
+    # Set once the first-run dialog has been answered. Its absence is what
+    # makes a fresh install ask; nothing else depends on it.
+    first_run_done: bool = False
     # Whether a confirmed active attacker (port scan, stealth scan, correlated
     # multi-stage activity) gets a firewall drop rule automatically after
     # reconnaissance. Infrastructure (gateway, DNS), whitelisted addresses and
     # public — therefore spoofable — sources are excluded regardless.
     auto_block: bool = True
+    # How long an on-demand device dossier (Devices tab → right click) stays
+    # valid, in seconds. Kept well under a typical DHCP lease: an IP identifies
+    # a device only until the lease moves, so old answers must not be presented
+    # as current ones. Results live in memory only and never reach disk.
+    device_intel_ttl: int = 900
     known_processes: list = field(default_factory=lambda: [
         # Browsers
         "firefox", "chromium", "brave", "brave-browser", "chrome",
@@ -143,6 +169,19 @@ def load_config() -> MazeConfig:
             # Adopt new default threshold if saved value is still the old default (10).
             if cfg.port_scan_threshold == 10:
                 cfg.port_scan_threshold = 25
+            # An existing config file means an existing user: they have already
+            # made these choices in the interface, and greeting them with a
+            # first-run wizard on upgrade would be a downgrade.
+            if "first_run_done" not in data:
+                cfg.first_run_done = True
+            # v2: auto profile switching became the default. Every config
+            # written before that carries auto_profile_switch=false — not
+            # because anyone chose it, but because that was what save_config
+            # wrote for the old default — so it is migrated once. Someone who
+            # turns it off again from now on keeps their choice.
+            if int(data.get("config_version", 1)) < 2:
+                cfg.auto_profile_switch = True
+                cfg.config_version = 2
             return cfg
         except Exception as e:
             from maze.utils.logger import log

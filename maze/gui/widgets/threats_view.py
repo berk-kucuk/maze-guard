@@ -150,7 +150,15 @@ class ThreatsView(QWidget):
 
     # ── data ──────────────────────────────────────────────────────────────
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self.refresh()
+
     def refresh(self) -> None:
+        # Rebuilding the table for a hidden widget is wasted work; showEvent
+        # refreshes when the tab (or the window, from the tray) comes back.
+        if not self.isVisible():
+            return
         s = self._state
         attackers = self._engine.incidents.all()
 
@@ -232,9 +240,12 @@ class ThreatsView(QWidget):
         ]
         if att.ports_targeted:
             ports = sorted(att.ports_targeted)
+            # ports_targeted is a bounded sample; ports_probed is what was
+            # really counted, and the two must not contradict the alert text.
+            total = max(getattr(att, "ports_probed", 0), len(ports))
             shown = ", ".join(str(p) for p in ports[:30])
             more = f"  (+{len(ports) - 30})" if len(ports) > 30 else ""
-            lines.append(f"{s.t('threats_ports')} ({len(ports)}): {shown}{more}")
+            lines.append(f"{s.t('threats_ports')} ({total}): {shown}{more}")
 
         recon = att.recon or {}
         if recon:
@@ -263,6 +274,24 @@ class ThreatsView(QWidget):
                 lines.append(f"{s.t('threats_findings')}:")
                 for f in recon["findings"]:
                     lines.append(f"  ! {f}")
+
+        pb = getattr(att, "post_block", None) or {}
+        if pb.get("packets"):
+            # The dossier used to end at "blocked", which is the least
+            # interesting moment: whether they gave up or kept working at it
+            # is what says who they were.
+            lines += ["", f"── {s.t('threats_after_block')} ──",
+                      f"{s.t('threats_dropped')}: {pb['packets']}"
+                      + (f"  ({', '.join(pb.get('protocols', []))})"
+                         if pb.get("protocols") else "")]
+            if pb.get("ports"):
+                ports = pb["ports"]
+                shown = ", ".join(str(p) for p in ports[:20])
+                more = f"  (+{len(ports) - 20})" if len(ports) > 20 else ""
+                lines.append(f"{s.t('threats_tried_ports')}: {shown}{more}")
+            if pb.get("last"):
+                lines.append(f"{s.t('threats_last_attempt')}: "
+                             f"{pb['last'].replace('T', ' ')}")
 
         if att.actions:
             lines += ["", f"── {s.t('threats_actions')} ──"]

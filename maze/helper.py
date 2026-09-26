@@ -7,6 +7,7 @@ the `maze` group (members can connect; everyone else is rejected by both file
 permissions and an in-process peer-credential check).
 """
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -48,25 +49,84 @@ _FWC_SAFE_FLAGS = {
 _LOG_CLAUSE = r'(?:log prefix=MAZE-[A-Z]{1,10} level=info limit value=[1-9]/m )?'
 # Rich rules are matched in FULL against these patterns (never by prefix, which
 # would let a client append arbitrary actions like accept/forward-port/masquerade
-# after a legal-looking source= clause). The action is locked to `drop`, and an
-# all-traffic source (0.0.0.0/0, ::/0) is rejected so a maze-group member can
-# neither redirect traffic nor black-hole the whole system through this channel.
+# after a legal-looking source= clause). The action is locked to `drop`.
+#
+# The two source-address patterns CAPTURE the address rather than trying to
+# judge it. How much of the internet a CIDR block covers is a property of its
+# mask, not of its text, and a regex cannot see that: the earlier version
+# forbade the literal strings "0.0.0.0" and "::" and so accepted `1.2.3.4/0`
+# — which is every address there is — along with `0.0.0.0/1` plus
+# `128.0.0.0/1`, two rules that take the machine off the network. The mask is
+# checked in _fwc_address_ok() below, with ipaddress doing the parsing.
 _FWC_RULE_RES = (
     re.compile(
         r'^rule family=ipv4 source address='
-        r'(?!0\.0\.0\.0(/0)?(?: |$))'          # forbid catch-all source
-        r'\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})? ' + _LOG_CLAUSE + r'drop$'
+        r'(\d{1,3}(?:\.\d{1,3}){3}(?:/\d{1,2})?) ' + _LOG_CLAUSE + r'drop$'
     ),
     re.compile(
         r'^rule family=ipv6 source address='
-        r'(?!::(/0)?(?: |$))'                  # forbid catch-all source
-        r'[0-9a-fA-F:]{2,39}(?:/\d{1,3})? ' + _LOG_CLAUSE + r'drop$'
+        r'([0-9a-fA-F:]{2,39}(?:/\d{1,3})?) ' + _LOG_CLAUSE + r'drop$'
     ),
     re.compile(
         r'^rule family=ipv[46] port port=\d{1,5} protocol=(?:tcp|udp) '
         + _LOG_CLAUSE + r'drop$'
     ),
+    # Blocking by hardware address. An IP is a DHCP lease: a host that renews
+    # it walks around an address block, and this application knows that better
+    # than most since it says so on the Devices tab. A MAC is only meaningful
+    # on the local segment — which is exactly the threat model — and the rule
+    # is still locked to `drop` with no catch-all form to abuse.
+    re.compile(
+        r'^rule source mac=(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2} '
+        + _LOG_CLAUSE + r'drop$'
+    ),
 )
+
+# How broad a single source-address block may be.
+#
+# Maze Guard itself only ever blocks single hosts (/32, /128 — see
+# protection/firewall.py::_ip_rule), but the Firewall tab lets someone type a
+# CIDR by hand, and blocking 10.0.0.0/8 or 192.168.0.0/16 is a legitimate thing
+# to want. What must not be reachable is the handful of rules that black-hole
+# the machine: at /8 it takes 256 of them to cover IPv4 and the first one
+# already breaks the user's own connection visibly, whereas /0 and /1 did it in
+# one or two, silently, and permanently (--permanent), while UNDOING it needs
+# the polkit admin prompt that _needs_consent puts in front of
+# --remove-rich-rule. That asymmetry is what made the missing mask check worth
+# more than an ordinary input-validation slip.
+_MIN_PREFIX_V4 = 8
+_MIN_PREFIX_V6 = 32
+
+
+def _fwc_address_ok(text: str) -> bool:
+    """True if a rich-rule source address is a real address, narrow enough.
+
+    ipaddress does the parsing so the mask is judged as a number rather than as
+    text: 1.2.3.4/0 and 0.0.0.0/0 are the same network and are both refused,
+    which reading the address portion alone could never tell.
+    """
+    try:
+        # strict=False: "192.168.1.5/24" names a host inside a network rather
+        # than the network itself, and firewalld accepts that spelling.
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return False
+    floor = _MIN_PREFIX_V4 if net.version == 4 else _MIN_PREFIX_V6
+    return net.prefixlen >= floor
+
+
+def _fwc_rule_ok(arg: str) -> bool:
+    """Full validation of one rich-rule string: shape, then blast radius."""
+    for rx in _FWC_RULE_RES:
+        m = rx.match(arg)
+        if not m:
+            continue
+        # Only the two source-address patterns capture a group; port and MAC
+        # rules carry no address to size up.
+        return _fwc_address_ok(m.group(1)) if m.groups() else True
+    return False
+
+
 # Zone names accepted after --zone. The full built-in set is allowed because
 # this only says *which* zone a rule applies to, and the host's default zone
 # could legitimately be any of them. What made "trusted" dangerous was
@@ -75,11 +135,22 @@ _FWC_RULE_RES = (
 _FWC_SAFE_ZONES  = ("public", "home", "drop", "block", "internal", "work",
                     "trusted", "external", "dmz")
 _SYSCTL_ALLOWED = {
+    # Fingerprint normalisation. Every one of these only changes how this host
+    # presents itself; none of them can open a port, grant access or weaken a
+    # filter, which is why they are safe to expose on this socket.
     "net.ipv4.ip_default_ttl",
+    "net.ipv6.conf.all.hop_limit",
+    "net.ipv4.tcp_timestamps",
+    # Retained so a GUI older than this daemon can still restore what it set.
     "net.ipv4.tcp_window_scaling",
 }
 # systemd units the helper may stop/start (hostname/mDNS hiding).
-_SVC_ALLOWED    = {"avahi-daemon"}
+#
+# The .socket unit belongs here as much as the service does: it is configured
+# to start the responder again on the first client connection, and clients
+# (CUPS, file managers, nss-mdns) connect without being asked. Allowing only
+# the service meant the hostname-hiding toggle quietly undid itself.
+_SVC_ALLOWED    = {"avahi-daemon", "avahi-daemon.socket"}
 _SVC_ACTIONS    = {"stop", "start", "is-active"}
 # The firewall backend gets its own command (`fw_service`) rather than riding on
 # the generic `svc` one: stopping it is the single most consequential thing a
@@ -112,7 +183,11 @@ def _needs_consent(args: list[str]) -> str:
     if _FWC_REMOVE_RULE in args:
         rule = args[args.index(_FWC_REMOVE_RULE) + 1] if \
             args.index(_FWC_REMOVE_RULE) + 1 < len(args) else ""
-        if "source address=" in rule:
+        # A block by hardware address is as much an attacker block as one by
+        # IP — it is the variant that survives the attacker renewing a DHCP
+        # lease — so removing it needs the same consent. Checking only for
+        # "source address=" let any maze-group process lift MAC blocks silently.
+        if "source address=" in rule or "source mac=" in rule:
             return "remove a block on an attacker"
     return ""
 
@@ -264,6 +339,7 @@ def _peer_allowed(writer: asyncio.StreamWriter) -> bool:
 
 
 def _push(event: dict) -> None:
+    _CAPTURE["pushed"] += 1
     if not _loop or not _clients:
         return
     data = (json.dumps(event) + "\n").encode()
@@ -283,6 +359,10 @@ def _get_iface_ips(iface: str) -> set[str]:
             ["ip", "addr", "show", iface], text=True, timeout=3)
         for m in _re.finditer(r'inet (\d+\.\d+\.\d+\.\d+)/', out):
             own.add(m.group(1))
+        # IPv6 addresses are ours too. Omitting them meant our own v6 traffic
+        # was pushed to the clients as somebody else's.
+        for m in _re.finditer(r'inet6 ([0-9a-fA-F:]+)/', out):
+            own.add(m.group(1))
     except Exception:
         pass
     return own
@@ -300,6 +380,22 @@ def _get_iface_ips(iface: str) -> set[str]:
 #                             dropping ACK-bearing packets removes essentially
 #                             all normal traffic while keeping every probe
 #   udp 67/68               — DHCP, for rogue-server detection
+#   udp dst port 53         — plaintext DNS *queries*, for leak/hijack
+#                             detection. The one class of packet we want from
+#                             this host rather than towards it: a query
+#                             escaping the VPN tunnel is the leak, and it is
+#                             ours. Only the question is captured — the answer
+#                             adds nothing this does not already know, and
+#                             admitting it would double the volume.
+#   ip6 tcp without ACK     — the same scan detection over IPv6. BPF cannot
+#                             use tcp[tcpflags] on v6 (the offset is only
+#                             fixed when no extension headers are present), so
+#                             the flag byte is read at its literal position:
+#                             40 bytes of IPv6 header + 13 into the TCP header.
+#   icmp6 type 128/134      — v6 ping sweeps, and Router Advertisements. A
+#                             forged RA is the IPv6 MITM: it makes the
+#                             attacker your default router, and unlike rogue
+#                             DHCP it needs no lease and no race.
 _SNIFF_BPF = (
     "arp"
     " or (icmp and (icmp[icmptype] = 8 or icmp[icmptype] = 13"
@@ -307,8 +403,19 @@ _SNIFF_BPF = (
     " or (tcp and tcp[tcpflags] & tcp-ack = 0 and"
     " (tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-push|tcp-urg) != 0"
     " or tcp[tcpflags] = 0))"
-    " or (udp and (port 67 or port 68))"
+    " or (udp and (port 67 or port 68 or dst port 53))"
+    " or (ip6 and tcp and ip6[53] & 0x10 = 0)"
+    " or (icmp6 and (ip6[40] = 128 or ip6[40] = 134))"
 )
+# What the capture has actually done since the daemon started. This exists to
+# answer one question the GUI cannot answer for itself: when a detector has
+# received no packets, is the network quiet or is the capture dead? The two
+# look identical from the client side and mean opposite things — "nobody is
+# attacking you" versus "you would not know if they were" — so the counters
+# are kept here, where the packets actually arrive, and read back on request.
+_CAPTURE = {"packets": 0, "pushed": 0, "iface": "", "started": 0.0}
+
+
 # Ceiling on packets forwarded to clients per second. A scan can arrive far
 # faster than any of this is worth reporting individually; past the ceiling we
 # count instead of forward and publish the count, so the GUI still learns the
@@ -353,14 +460,17 @@ def _tcp_flag_str(flags) -> str:
         return ""
 
 
-def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int) -> None:
-    from scapy.all import ARP, DHCP, ICMP, IP, TCP, sniff
+def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int,
+                should_stop=None) -> None:
+    from scapy.all import ARP, DHCP, ICMP, IP, IPv6, TCP, UDP, sniff
+    from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6EchoRequest
 
     own_ips: set[str] = _get_iface_ips(iface)
     own_ips_refreshed_at: float = time.monotonic()
 
     def handle(pkt):
         nonlocal own_ips, own_ips_refreshed_at
+        _CAPTURE["packets"] += 1
         # Refresh every 60 s — replace (not update) so old-network IPs evict.
         now = time.monotonic()
         if now - own_ips_refreshed_at >= 60:
@@ -378,9 +488,28 @@ def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int) -> None:
                    "mac": arp.hwsrc, "dst": arp.pdst})
             return
 
+        if pkt.haslayer(IPv6):
+            _handle_v6(pkt, own_ips, limiter)
+            return
+
         if not pkt.haslayer(IP):
             return
         src, dst = pkt[IP].src, pkt[IP].dst
+
+        # DNS is handled before the own-address filter on purpose. Every other
+        # packet here is something being done *to* this host, so traffic we
+        # sent is noise; a plaintext DNS query is the opposite — the leak that
+        # matters is the one leaving this machine, and it carries our address.
+        if pkt.haslayer(UDP) and int(pkt[UDP].dport) == 53:
+            # Only our own queries. In promiscuous mode we also see the
+            # neighbours' DNS, which is neither our business nor our leak.
+            if src in own_ips:
+                if limiter.allow():
+                    _push({"event": "dns", "src": src, "dst": dst,
+                           "sport": int(pkt[UDP].sport), "dport": 53,
+                           "outbound": True})
+            return
+
         if src in own_ips:          # our own probes are not attacks on us
             return
 
@@ -418,23 +547,111 @@ def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int) -> None:
                        "mac": pkt.src if hasattr(pkt, "src") else ""})
 
     sniff(iface=iface, filter=_SNIFF_BPF, prn=handle, store=False,
-          timeout=stop_after)
+          timeout=stop_after, stop_filter=should_stop)
+
+
+def _handle_v6(pkt, own_ips: set, limiter: "_PushLimiter") -> None:
+    """Push the IPv6 packets that mean something to a detector.
+
+    Deliberately narrow, and in the same shape the IPv4 branch uses: the client
+    side analyses addresses as opaque strings, so a v6 source flows through the
+    scan detector and the dossier without any of them knowing the difference.
+    """
+    from scapy.all import IPv6, TCP
+    from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6EchoRequest
+
+    ip6 = pkt[IPv6]
+    src, dst = str(ip6.src), str(ip6.dst)
+
+    # A Router Advertisement is reported whoever sent it — including ourselves
+    # in the pathological case — because the question it answers is "how many
+    # routers claim this link", and an answer that hides one is useless.
+    if pkt.haslayer(ICMPv6ND_RA):
+        if limiter.allow():
+            _push({"event": "ra", "src": src, "dst": dst,
+                   "lifetime": int(getattr(pkt[ICMPv6ND_RA], "routerlifetime", 0)),
+                   "prf": int(getattr(pkt[ICMPv6ND_RA], "prf", 0))})
+        return
+
+    if src in own_ips:
+        return
+
+    if pkt.haslayer(TCP):
+        if not limiter.allow():
+            return
+        tcp = pkt[TCP]
+        _push({"event": "tcp", "src": src, "dst": dst,
+               "sport": int(tcp.sport), "dport": int(tcp.dport),
+               "flags": _tcp_flag_str(tcp.flags), "ttl": int(ip6.hlim),
+               "win": int(tcp.window), "v6": True})
+    elif pkt.haslayer(ICMPv6EchoRequest):
+        if limiter.allow():
+            _push({"event": "icmp", "src": src, "dst": dst,
+                   "type": 8, "ttl": int(ip6.hlim), "v6": True})
+
+
+# How long one capture slice runs before the socket is torn down and rebuilt.
+#
+# This used to be 60 seconds, which meant roughly 600 open/close cycles in a
+# five-hour session — every one of them putting the interface in and out of
+# promiscuous mode. On a wired NIC that is only waste. On a USB WiFi adapter it
+# is a hazard: tearing a capture down and standing it back up is exactly the
+# path where rt2x00usb and friends mishandle a device that vanishes mid-flight,
+# and that is not an exotic setup here — an external adapter is the normal way
+# to get monitor mode, so it is what much of this audience runs.
+#
+# Long slices do not cost responsiveness, because `stop_filter` below leaves the
+# capture the moment the interface actually changes rather than waiting for the
+# slice to end. The timeout is now only a backstop for a link that goes away on
+# an interface so quiet that no packet arrives to notice it with.
+_SLICE_SECONDS = 600
+
+
+def _iface_change_detector(current: str):
+    """A scapy stop_filter that ends the capture when the link moved.
+
+    Called once per captured packet, so it must be cheap: the answer is cached
+    for a second, which on a busy interface turns thousands of resolutions into
+    one. Any error means "keep capturing" — losing the capture is worse than a
+    late switch, and the slice timeout catches it either way.
+    """
+    state = {"at": 0.0, "changed": False}
+
+    def stop(_pkt) -> bool:
+        now = time.monotonic()
+        if now - state["at"] < 1.0:
+            return state["changed"]
+        state["at"] = now
+        try:
+            resolved = _resolve_iface(current)
+            state["changed"] = bool(resolved and resolved != current)
+        except Exception:
+            state["changed"] = False
+        return state["changed"]
+
+    return stop
 
 
 def _sniff_thread(iface: str) -> None:
     """Capture forever, surviving link changes.
 
-    The capture is run in bounded slices rather than one endless call so the
-    interface can be re-resolved between them. Without that, a WiFi reconnect or
-    a switch to Ethernet left the helper sniffing a dead interface and the GUI
-    silently blind — the failure mode looked exactly like "no attacks today".
+    The capture is bounded rather than one endless call so the interface can be
+    re-resolved. Without that, a WiFi reconnect or a switch to Ethernet left the
+    helper sniffing a dead interface and the GUI silently blind — the failure
+    mode looked exactly like "no attacks today".
+
+    What bounds it is a `stop_filter` that notices the change, with a long
+    timeout behind it; see _SLICE_SECONDS for why not a short timeout alone.
     """
     limiter = _PushLimiter(_PUSH_RATE_LIMIT)
     current = iface
     backoff = 1.0
+    _CAPTURE["started"] = time.monotonic()
     while True:
+        _CAPTURE["iface"] = current
         try:
-            _sniff_once(current, limiter, stop_after=60)
+            _sniff_once(current, limiter, stop_after=_SLICE_SECONDS,
+                        should_stop=_iface_change_detector(current))
             backoff = 1.0
         except Exception as exc:
             _push({"event": "error", "msg": f"capture on {current}: {exc}"})
@@ -460,27 +677,72 @@ class _Completed:
 
 
 async def _run(args: list[str], timeout: float = 10.0):
-    """Run a command off the event loop, with a hard time limit.
+    """Run a command without blocking the event loop, with a hard time limit.
 
-    Both halves matter. `subprocess.run` called straight from a coroutine
-    blocks the *entire* helper — one slow command and no other client request,
-    not even a ping, gets answered. And `firewall-cmd` is not reliably fast: with
-    firewalld stopped it sits in D-Bus activation until that times out, so a UI
-    polling the rule list every few seconds could wedge the daemon indefinitely.
-    Everything the helper shells out to goes through here.
+    `subprocess.run` called straight from a coroutine blocks the *entire*
+    helper — one slow command and no other client request, not even a ping,
+    gets answered. And `firewall-cmd` is not reliably fast: with firewalld
+    stopped it sits in D-Bus activation until that times out. Everything the
+    helper shells out to goes through here.
+
+    An asyncio subprocess, not `subprocess.run` in a worker thread. The thread
+    version could not be cancelled: a hung child held its worker until its own
+    timeout, enough of them exhausted the default executor (min(32, cpu+4)
+    workers) and then no command ran at all; and on SIGTERM, asyncio.run()
+    waited for those threads to finish, so `systemctl stop/restart` sat out its
+    10 s stop timeout and SIGKILLed the helper. Here a timeout OR a cancellation
+    kills the child and the coroutine returns at once — shutdown included.
+
+    Every way of giving up is written to the journal. A silent failure here
+    reached the GUI as a firewall that "is not installed".
     """
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(subprocess.run, args,
-                              capture_output=True, text=True),
-            timeout=timeout,
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
         )
+    except Exception as exc:
+        print(f"maze-helper: could not start {' '.join(args)}: {exc}",
+              file=sys.stderr, flush=True)
+        return _Completed(stderr=str(exc))
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (asyncio.TimeoutError, TimeoutError):
+        _kill_child(proc)
+        await _reap(proc)
         print(f"maze-helper: timed out after {timeout}s: {' '.join(args)}",
               file=sys.stderr, flush=True)
         return _Completed(stderr=f"timed out after {timeout}s")
-    except Exception as exc:
-        return _Completed(stderr=str(exc))
+    except asyncio.CancelledError:
+        # The request was abandoned (client gone, helper stopping): the child
+        # must not outlive it.
+        _kill_child(proc)
+        raise
+    return _Completed(returncode=proc.returncode,
+                      stdout=out.decode(errors="replace"),
+                      stderr=err.decode(errors="replace"))
+
+
+def _kill_child(proc) -> None:
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+
+
+async def _reap(proc) -> None:
+    """Collect a killed child so it does not linger as a zombie."""
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+    except (asyncio.TimeoutError, TimeoutError):
+        pass
+
+
+def _fw_unit_installed() -> bool:
+    return any(Path(d, f"{_FW_UNIT}.service").exists()
+               for d in ("/etc/systemd/system", "/usr/lib/systemd/system"))
 
 
 async def _firewalld_active() -> bool:
@@ -493,6 +755,33 @@ async def _firewalld_active() -> bool:
     return r.stdout.strip() == "active"
 
 
+# Read-side cache for the firewall queries. Every one of them is one or more
+# `firewall-cmd` processes — a Python interpreter start plus a D-Bus round trip
+# that firewalld and polkit both have to service — and several GUI widgets ask
+# on their own timers. Measured on a laptop with the window open: ~1.2
+# firewall-cmd spawns per second, ~40% of a core across helper + firewalld +
+# polkit, and a CPU that never cooled below 50 °C. Answers a few seconds old
+# are perfectly good for a status widget; anything that CHANGES the firewall
+# (fw_cmd, fw_service) drops the cache so the next read is fresh.
+_FW_CACHE_TTL = 5.0
+_fw_cache: dict[str, tuple[float, dict]] = {}
+
+
+def _fw_cached(key: str) -> dict | None:
+    hit = _fw_cache.get(key)
+    if hit and time.monotonic() - hit[0] < _FW_CACHE_TTL:
+        return dict(hit[1])
+    return None
+
+
+def _fw_remember(key: str, resp: dict) -> None:
+    _fw_cache[key] = (time.monotonic(), dict(resp))
+
+
+def _fw_forget() -> None:
+    _fw_cache.clear()
+
+
 async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
     """Execute one request and return its response envelope."""
     cmd    = req.get("cmd", "")
@@ -503,12 +792,16 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
         resp["ok"] = True
 
     elif cmd == "fw_list_all":
-        if not await _firewalld_active():
+        cached = _fw_cached("list_all")
+        if cached is not None:
+            resp.update(cached)
+        elif not await _firewalld_active():
             resp.update(ok=True, data="", err="firewalld is not running")
         else:
             r = await _run(["firewall-cmd", "--list-all"])
             resp.update(ok=(r.returncode == 0 or r.returncode == 252),
                         data=r.stdout)
+            _fw_remember("list_all", {k: resp[k] for k in ("ok", "data")})
 
     elif cmd == "fw_cmd":
         # Validate: only allow a curated whitelist of firewall-cmd flags
@@ -525,7 +818,7 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                     continue
                 if a in _FWC_SAFE_ZONES:
                     continue
-                if any(rx.match(a) for rx in _FWC_RULE_RES):
+                if _fwc_rule_ok(a):
                     continue
                 bad = True
                 resp["err"] = f"disallowed firewall-cmd argument: {a}"
@@ -543,24 +836,38 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                     r = await _run(args, timeout=20.0)
                     resp.update(ok=(r.returncode == 0 or r.returncode == 252),
                                 err=r.stderr.strip())
+                    _fw_forget()
+
+    elif cmd == "fw_list" and _fw_cached("list") is not None:
+        resp.update(_fw_cached("list"))
 
     elif cmd == "fw_list":
         import re as _re
-        data = {"ips": [], "ports_tcp": [], "ports_udp": []}
+        data = {"ips": [], "ports_tcp": [], "ports_udp": [], "macs": []}
         r = (await _run(["firewall-cmd", "--list-rich-rules"])
              if await _firewalld_active() else _Completed())
         if r.returncode == 0 or r.returncode == 252:
             ip_re = _re.compile(r'source address="?([^"\s]+)"?')
+            mac_re = _re.compile(r'source mac="?((?:[0-9a-fA-F]{2}:){5}'
+                                 r'[0-9a-fA-F]{2})"?')
             port_re = _re.compile(r'port port="?(\d+)"? protocol="?(tcp|udp)"?')
             for line in r.stdout.splitlines():
                 m = ip_re.search(line)
                 if m:
                     data["ips"].append(m.group(1))
                     continue
+                m = mac_re.search(line)
+                if m:
+                    data["macs"].append(m.group(1).lower())
+                    continue
                 m = port_re.search(line)
                 if m and int(m.group(1)) not in data[f"ports_{m.group(2)}"]:
                     data[f"ports_{m.group(2)}"].append(int(m.group(1)))
         resp.update(ok=True, data=data)
+        _fw_remember("list", {"ok": True, "data": data})
+
+    elif cmd == "fw_state" and _fw_cached("state") is not None:
+        resp.update(_fw_cached("state"))
 
     elif cmd == "fw_state":
         # One round-trip snapshot of everything the UI needs to render
@@ -570,16 +877,29 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
         state = {"installed": False, "running": False, "enabled": False,
                  "zone": "", "target": "", "panic": False}
         try:
+            # "Installed" from the unit file on disk, not from the probe below:
+            # a probe that timed out or failed to start used to make an
+            # installed, running firewalld read as "not installed" — the GUI's
+            # "Unavailable" — and that wrong answer was then cached.
+            state["installed"] = _fw_unit_installed()
             r = await _run(["systemctl", "is-active", _FW_UNIT], timeout=5.0)
-            state["installed"] = r.stdout.strip() != "" or r.returncode in (0, 3)
+            if not r.stdout.strip():
+                # systemctl always names a state (active, inactive, failed,
+                # ...); nothing at all means the question was never answered.
+                raise RuntimeError("could not read the firewalld state: "
+                                   + (r.stderr.strip() or f"exit {r.returncode}"))
             state["running"] = r.stdout.strip() == "active"
             r = await _run(["systemctl", "is-enabled", _FW_UNIT], timeout=5.0)
             state["enabled"] = r.stdout.strip() == "enabled"
             if state["running"]:
-                r = await _run(["firewall-cmd", "--get-default-zone"])
-                state["zone"] = r.stdout.strip()
+                # `--list-all` describes the default zone and names it on its
+                # first line ("public (default, active)"), so a separate
+                # --get-default-zone process is one interpreter start wasted.
                 r = await _run(["firewall-cmd", "--list-all"])
-                for line in r.stdout.splitlines():
+                lines = r.stdout.splitlines()
+                if lines:
+                    state["zone"] = lines[0].strip().split()[0] if lines[0].strip() else ""
+                for line in lines:
                     s = line.strip().lower()
                     if s.startswith("target:"):
                         state["target"] = s.split(":", 1)[1].strip()
@@ -588,7 +908,12 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                 state["panic"] = r.stdout.strip() == "yes"
         except Exception as e:
             resp["err"] = str(e)
-        resp.update(ok=True, data=state)
+        # A half-read state is not an answer: say so (ok=False) and cache
+        # nothing, so the very next poll asks again instead of the GUI showing
+        # a guess until the cache expires.
+        resp.update(ok="err" not in resp, data=state)
+        if "err" not in resp:
+            _fw_remember("state", {"ok": True, "data": state})
 
     elif cmd == "fw_service":
         action = req.get("action", "")
@@ -605,6 +930,7 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                 resp["err"] = why
             else:
                 r = await _run(["systemctl", action, _FW_UNIT], timeout=45.0)
+                _fw_forget()
                 # is-active/is-enabled report status through their exit code;
                 # a non-zero there means "inactive", not "command failed".
                 resp.update(ok=(query or r.returncode == 0),
@@ -659,13 +985,21 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
         except Exception as e:
             resp["err"] = str(e)
 
+    elif cmd == "capture_stats":
+        stats = dict(_CAPTURE)
+        stats["uptime_s"] = (round(time.monotonic() - stats["started"], 1)
+                             if stats["started"] else 0.0)
+        stats.pop("started", None)
+        resp.update(ok=True, data=stats)
+
     elif cmd == "sysctl_get":
         key = req.get("key", "")
         if key not in _SYSCTL_ALLOWED:
             resp["err"] = "disallowed sysctl key"
         else:
             r = await _run(["sysctl", "-n", key], timeout=5.0)
-            resp.update(ok=r.returncode == 0, data=r.stdout.strip())
+            resp.update(ok=r.returncode == 0, data=r.stdout.strip(),
+                        err=r.stderr.strip())
 
     elif cmd == "sysctl_set":
         key   = req.get("key", "")
@@ -699,6 +1033,13 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
     # keeps a client from spawning unbounded work.
     gate = asyncio.Semaphore(4)
     pending: set[asyncio.Task] = set()
+    # The semaphore caps how many requests RUN at once, not how many are
+    # created. A client that pipelines lines faster than they are served could
+    # sit thousands of tasks in this set waiting their turn — bounded only by
+    # how fast it can write. Past this many outstanding, stop reading instead:
+    # the socket's own buffer then applies the back-pressure, which is where it
+    # belongs. Far above anything the GUI does on a timer.
+    _MAX_PENDING = 64
 
     async def serve(req: dict) -> None:
         async with gate:
@@ -713,7 +1054,20 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 pass
 
     try:
-        async for raw in reader:
+        while True:
+            # readline(), not `async for`: iterating the reader raises
+            # ValueError when a line runs past asyncio's 64 KB limit, and that
+            # is not one of the exceptions caught below — it escaped as an
+            # unretrieved task exception instead of closing the connection.
+            # A request that long is malformed by definition; every command
+            # this helper takes is a short JSON object.
+            try:
+                raw = await reader.readline()
+            except ValueError:
+                _audit(writer, "closing connection: request line too long")
+                break
+            if not raw:
+                break
             line = raw.strip()
             if not line:
                 continue
@@ -721,6 +1075,9 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 req = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            while len(pending) >= _MAX_PENDING:
+                # Wait for room rather than queueing without limit.
+                await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
             task = asyncio.create_task(serve(req))
             pending.add(task)
             task.add_done_callback(pending.discard)
@@ -794,10 +1151,27 @@ async def _serve(sock_path: str, iface: str) -> None:
     _setup_socket_perms(sock_path)
 
     threading.Thread(target=_sniff_thread, args=(iface,), daemon=True).start()
-    _loop.add_signal_handler(signal.SIGTERM, _loop.stop)
+
+    # Stop on SIGTERM by waking this coroutine, not with loop.stop(): under
+    # asyncio.run() stopping the loop while the main task is still pending
+    # raises "Event loop stopped before Future completed", which systemd then
+    # records as status=1/FAILURE on every single shutdown. start_unix_server
+    # is already serving; leaving the `async with` closes the socket.
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        _loop.add_signal_handler(sig, stop.set)
 
     async with server:
-        await server.serve_forever()
+        await stop.wait()
+        # Hang up on every client before leaving `async with`: since Python
+        # 3.12 Server.wait_closed() waits for all connections to end on their
+        # own, and the GUI never disconnects. Every `systemctl stop/restart`
+        # with a Maze Guard window open sat out the stop timeout and ended in
+        # SIGKILL ("State 'stop-sigterm' timed out"). Closing a client ends its
+        # _handle loop, which cancels its in-flight requests and, through
+        # _run, kills their child processes.
+        for w in list(_clients):
+            w.close()
 
 
 def _resolve_iface(arg: str) -> str:

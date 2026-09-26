@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass, field
 
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
+from maze.core.verify import (FAIL, PASS, Verdict, WARN,
+                              capture_feed, merge)
 from maze.utils.logger import log
 
 _WINDOW            = 300   # activity older than this stops counting (seconds)
@@ -11,6 +13,12 @@ _PRUNE_INTERVAL    = 30    # how often stale records are swept
 _OWN_IP_REFRESH    = 60    # how often to re-read own interface IPs (seconds)
 _RE_ALERT_AFTER    = 600   # same source may raise the same alert again after
 _MAX_PORTS_TRACKED = 4096  # bound per-source memory against a full 65k sweep
+_PORTS_IN_PAYLOAD  = 256   # how many of them travel with the event
+# One direct-capture slice. Bounds how long stop() waits for the sniffing
+# thread on an interface with no traffic.
+_SNIFF_SLICE = 5
+_MAX_TARGETS       = 256   # bound per-source memory for observed destinations
+_MAX_RECORDS       = 4096  # bound the number of sources tracked at once
 
 # TCP flag combinations that no normal client produces. A stack opens a
 # connection with SYN and tears it down with FIN *after* an ACK-bearing
@@ -58,7 +66,10 @@ class ScanRecord:
         return {
             "src": self.src,
             "unique_ports": len(self.ports),
-            "ports": sorted(self.ports)[:64],
+            # A sample, not the whole set: the payload is journalled and shown
+            # in the UI, so it stays bounded. `unique_ports` above carries the
+            # real figure — anything reading this must count with that.
+            "ports": sorted(self.ports)[:_PORTS_IN_PAYLOAD],
             "targets": sorted(self.targets)[:16],
             "techniques": sorted(self.techniques),
             "packets": self.packets,
@@ -100,6 +111,8 @@ class PortScanDetector:
         self._stop_event = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._helper = None
+        self._capture = ""      # "helper" | "direct" — where packets come from
+        self._seen = 0          # probe packets accepted, for the self-test
 
     # ── introspection for the UI ──────────────────────────────────────────
 
@@ -119,6 +132,60 @@ class PortScanDetector:
     def records(self) -> list[ScanRecord]:
         return sorted(self._records.values(), key=lambda r: -len(r.ports))
 
+    def status_detail(self) -> str:
+        if self._capture == "direct":
+            return ("capturing directly — needs root; without it no packets "
+                    "are seen at all")
+        if not self._own_ips:
+            return ("this host's own addresses could not be read — traffic "
+                    "aimed at other machines may be counted")
+        return (f"threshold {self.threshold} ports · "
+                f"{len(self._records)} sources being watched")
+
+    async def verify(self) -> Verdict:
+        """Prove both halves: that packets arrive, and that a scan trips it.
+
+        Two independent things have to hold for this module to protect anyone,
+        and each can fail while the other looks fine. The capture is checked by
+        counting what has actually arrived. The analysis is checked by running
+        a synthetic sweep through a throwaway detector built exactly like this
+        one — no raw sockets, no traffic on the wire, nothing touched on the
+        system, and the real code path from packet to alarm.
+        """
+        alarm = await self._selftest_alarm()
+        feed = await capture_feed(self._helper, self._capture, self._seen,
+                                  "connection probes aimed at this host")
+        feed.evidence.append(
+            f"this host's addresses: "
+            f"{', '.join(sorted(self._own_ips)) or 'could not be read'}")
+        if self._records:
+            feed.evidence.append(f"{len(self._records)} sources being tracked")
+        return merge(alarm, feed)
+
+    async def _selftest_alarm(self) -> Verdict:
+        """Feed a synthetic sweep through a disposable copy of this detector."""
+        probe = PortScanDetector(self.interface, self.threshold)
+        probe._own_ips = {"198.51.100.1"}          # TEST-NET-2, ours for this
+        fired: list[Event] = []
+
+        class _Sink(EventBus):
+            async def emit(self, event):
+                fired.append(event)
+
+        probe._bus = _Sink()
+        probe._loop = asyncio.get_event_loop()
+        for port in range(1, self.threshold + 3):
+            await probe._process("198.51.100.9", port, "S", "198.51.100.1")
+        if not fired:
+            return Verdict(FAIL,
+                           f"the detector did NOT raise an alarm for a "
+                           f"synthetic {self.threshold + 2}-port sweep — port "
+                           f"scan detection is broken, not merely quiet")
+        return Verdict(PASS,
+                       f"a synthetic {self.threshold + 2}-port sweep raised "
+                       f"'{fired[0].type.value}' as it should",
+                       [fired[0].message])
+
     def evidence(self, src: str) -> dict | None:
         rec = self._records.get(src)
         return rec.summary() if rec else None
@@ -134,8 +201,10 @@ class PortScanDetector:
         self._own_ip_task  = asyncio.create_task(self._own_ip_refresh_loop())
         self._prune_task   = asyncio.create_task(self._prune_loop())
         if helper and helper.is_connected():
+            self._capture = "helper"
             helper.on_event(self._on_helper_event)
         else:
+            self._capture = "direct"
             self._task = asyncio.create_task(self._run_direct())
             log.warning("PortScanDetector: helper unavailable, trying direct sniff")
 
@@ -183,29 +252,57 @@ class PortScanDetector:
                                 msg.get("dst", ""))
 
     async def _run_direct(self) -> None:
+        """Capture without the helper, in bounded slices.
+
+        scapy only evaluates stop_filter when a packet arrives, so a single
+        endless sniff() on a quiet interface cannot be stopped at all: the
+        worker thread blocks until the next packet, and because it is not a
+        daemon thread, quitting the application waits for it too. Slicing the
+        capture bounds that wait to one interval.
+
+        The BPF admits IPv6 as well. It has to be spelled out separately —
+        libpcap cannot reach tcp[tcpflags] through a v6 header, so the flag
+        byte is read at its literal offset (40 bytes of IPv6 header + 13).
+        """
         try:
-            from scapy.all import TCP, IP, sniff
+            from scapy.all import TCP, IP, IPv6, sniff
+        except Exception as exc:
+            log.warning(f"PortScanDetector: scapy unavailable — {exc}")
+            return
 
-            def _on_pkt(pkt):
-                if not pkt.haslayer(IP) or not pkt.haslayer(TCP):
-                    return
-                asyncio.run_coroutine_threadsafe(
-                    self._process(pkt[IP].src, pkt[TCP].dport,
-                                  str(pkt[TCP].flags), pkt[IP].dst),
-                    self._loop)
+        bpf = ("(tcp and tcp[tcpflags] & tcp-ack = 0)"
+               " or (ip6 and tcp and ip6[53] & 0x10 = 0)")
 
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: sniff(
-                    iface=self.interface,
-                    filter="tcp and tcp[tcpflags] & tcp-ack = 0",
-                    prn=_on_pkt,
-                    store=False,
-                    stop_filter=lambda _: self._stop_event.is_set(),
-                ),
-            )
-        except Exception as e:
-            log.warning(f"PortScanDetector sniff error: {e}")
+        def _on_pkt(pkt):
+            if not pkt.haslayer(TCP):
+                return
+            if pkt.haslayer(IP):
+                src, dst = pkt[IP].src, pkt[IP].dst
+            elif pkt.haslayer(IPv6):
+                src, dst = pkt[IPv6].src, pkt[IPv6].dst
+            else:
+                return
+            asyncio.run_coroutine_threadsafe(
+                self._process(src, pkt[TCP].dport, str(pkt[TCP].flags), dst),
+                self._loop)
+
+        loop = asyncio.get_event_loop()
+        while not self._stop_event.is_set():
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda: sniff(
+                        iface=self.interface,
+                        filter=bpf,
+                        prn=_on_pkt,
+                        store=False,
+                        timeout=_SNIFF_SLICE,
+                        stop_filter=lambda _: self._stop_event.is_set(),
+                    ),
+                )
+            except Exception as e:
+                log.warning(f"PortScanDetector sniff error: {e}")
+                return
 
     # ── analysis ──────────────────────────────────────────────────────────
 
@@ -216,19 +313,44 @@ class PortScanDetector:
         if src in self._whitelist or src in self._own_ips:
             return
 
+        # Only traffic aimed at THIS host is evidence of a scan against us.
+        #
+        # The capture runs in promiscuous mode, so on a bridged VM host, a
+        # mirrored switch port or an old-style shared segment we also see
+        # conversations between other machines. Counting those made a busy
+        # neighbour — or the very server we were downloading from — look like
+        # it was sweeping our ports. Sweeps aimed at the network as a whole are
+        # still caught, by the anomaly detector, which is the module whose job
+        # that is. When our own addresses cannot be read the check is skipped
+        # rather than dropping everything: a detector that silently sees no
+        # traffic is worse than one that sees a little too much.
+        if dst and self._own_ips and dst not in self._own_ips:
+            return
+
+        technique = _classify(flags)
+        is_probe = _is_syn_probe(flags)
+        if not technique and not is_probe:
+            # Part of a conversation we are already in (anything carrying ACK)
+            # or a reset. A server resetting one of our ephemeral ports is not
+            # scanning us — but because every connection uses a *new* ephemeral
+            # port, counting those ports was enough on its own to push ordinary
+            # browsing past the breadth threshold.
+            return
+
         now = time.monotonic()
         rec = self._records.get(src)
         if rec is None:
+            self._evict_if_needed()
             rec = ScanRecord(src=src, first_seen=now, last_seen=now)
             self._records[src] = rec
+        self._seen += 1
         rec.last_seen = now
         rec.packets += 1
-        if dst:
+        if dst and len(rec.targets) < _MAX_TARGETS:
             rec.targets.add(dst)
         if len(rec.ports) < _MAX_PORTS_TRACKED:
             rec.ports.add(int(dport or 0))
 
-        technique = _classify(flags)
         if technique:
             rec.techniques.add(technique)
             rec.stealth_packets += 1
@@ -237,6 +359,19 @@ class PortScanDetector:
 
         rec.techniques.add("syn_scan")
         await self._maybe_alert_breadth(rec, now)
+
+    def _evict_if_needed(self) -> None:
+        """Keep the record table bounded.
+
+        A spoofed-source scan invents a new address per packet, so without this
+        a single burst could grow the table without limit in a process that is
+        expected to run for weeks. The quietest sources go first.
+        """
+        if len(self._records) < _MAX_RECORDS:
+            return
+        stale = sorted(self._records.values(), key=lambda r: r.last_seen)
+        for rec in stale[: len(self._records) - _MAX_RECORDS + 1]:
+            self._records.pop(rec.src, None)
 
     async def _maybe_alert_stealth(self, rec: ScanRecord, technique: str,
                                    now: float) -> None:
@@ -315,3 +450,15 @@ def _classify(flags: str) -> str:
     if "S" in f:
         return ""          # ordinary SYN — measured as breadth, not technique
     return _STEALTH_FLAGS.get(f, "")
+
+
+def _is_syn_probe(flags: str) -> bool:
+    """Whether this packet is a bare connection attempt.
+
+    Breadth is only meaningful for these. `_classify` deliberately answers ""
+    for both a plain SYN and a reset, and the two used to be handled the same
+    way further down — so every RST a server sent us was filed as one more
+    "port probed", with the port being our own ephemeral source port.
+    """
+    f = (flags or "").upper()
+    return "S" in f and "A" not in f and "R" not in f

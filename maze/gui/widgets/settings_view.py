@@ -8,22 +8,14 @@ from PyQt6.QtWidgets import (
     QPushButton, QLineEdit, QScrollArea, QFrame, QSizePolicy, QComboBox,
 )
 from PyQt6.QtCore import Qt
+
+from maze.gui import autostart
 import re
 
-_AUTOSTART_PATH = Path.home() / ".config" / "autostart" / "maze.desktop"
+_AUTOSTART_PATH = autostart.USER_PATH
 # A system-wide install (install.sh) drops this one; the settings checkbox must
 # reflect it too, otherwise it shows "off" while the app still autostarts.
-_SYS_AUTOSTART_PATH = Path("/etc/xdg/autostart/maze-guard.desktop")
-_AUTOSTART_TEMPLATE = """\
-[Desktop Entry]
-Type=Application
-Name=Maze Guard
-Exec={python} {script} --background
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-"""
-
+_SYS_AUTOSTART_PATH = autostart.SYSTEM_PATH
 _IP_RE = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')
 
 
@@ -362,20 +354,10 @@ class SettingsView(QWidget):
 
     def _toggle_autostart(self, enabled: bool) -> None:
         if enabled:
-            _AUTOSTART_PATH.parent.mkdir(parents=True, exist_ok=True)
-            # Find main.py from the package location
-            script = str(
-                Path(sys.modules["maze"].__file__).parent.parent / "main.py"
-            )
-            _AUTOSTART_PATH.write_text(
-                _AUTOSTART_TEMPLATE.format(
-                    python=sys.executable,
-                    script=script,
-                )
-            )
-            self._autostart_note.setText(f"Writes to {_AUTOSTART_PATH}")
+            path = autostart.enable()
+            self._autostart_note.setText(f"Writes to {path}")
         else:
-            _AUTOSTART_PATH.unlink(missing_ok=True)
+            autostart.disable()
             # A system-wide autostart entry can only be removed with root; warn
             # rather than silently leaving the app to keep launching on login.
             if _SYS_AUTOSTART_PATH.exists():

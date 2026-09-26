@@ -1,4 +1,5 @@
 import asyncio
+import time
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTabWidget, QFrame, QApplication,
@@ -7,7 +8,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QPixmap
 from maze.core.engine import MazeEngine
-from maze.core.events import Event, EventType, ThreatLevel
+from maze.core.events import Event, EventType, ThreatLevel, escalate
 from maze.core.profile import Profile
 from maze.gui.app_state import AppState
 from maze.gui.icons import create_app_icon
@@ -22,6 +23,10 @@ from maze.gui.widgets.dashboard_view import DashboardView
 from maze.gui.widgets.firewall_view import FirewallView
 from maze.utils.config import MazeConfig, save_config
 
+
+# Profiles that mean "this network is not mine" — the user has already told
+# us that strangers are expected here.
+_UNTRUSTED_PROFILES = {Profile.PUBLIC, Profile.PARANOID, Profile.SECURE}
 
 _PROFILES = [
     (Profile.HOME,     "profile_home"),
@@ -61,6 +66,14 @@ class Dashboard(QMainWindow):
         self.engine = engine
         self.cfg = cfg
         self.state = state
+        self._threat_level = ThreatLevel.SAFE
+        # New-device popup damping, per network — see _new_device_popup_allowed.
+        self._newdev_net = ""
+        self._newdev_times: list[float] = []
+        self._newdev_muted_until = 0.0
+        # Threat popup damping — see _popup_allowed.
+        self._popup_last: dict[tuple, float] = {}
+        self._popup_times: list[float] = []
 
         self.setWindowTitle("Maze Guard")
         self.setWindowIcon(create_app_icon(64))
@@ -195,7 +208,7 @@ class Dashboard(QMainWindow):
         self.dash_view     = DashboardView(self.state, self.engine, self.cfg)
         self.event_list    = EventListWidget(self.state, self.engine)
         self.conn_map      = ConnectionMapWidget(self.state)
-        self.device_list   = DeviceListWidget(self.state)
+        self.device_list   = DeviceListWidget(self.state, self.engine, self.cfg)
         self.module_status = ModuleStatusWidget(self.state, self.engine)
         self.firewall_view = FirewallView(self.state, self.engine)
 
@@ -230,11 +243,31 @@ class Dashboard(QMainWindow):
         event.ignore()
         self.hide()
 
+    # Polling while hidden in the tray is pure waste: the tabs each spawn
+    # firewall-cmd / iw / ip and walk /proc through the helper on their
+    # timers, which measured as ~40% of a core for a window nobody could
+    # see. Every timer callback checks isVisible() instead — a hidden main
+    # window makes all of them false — and showEvent brings the view back
+    # up to date the moment it is restored. Threat detection is unaffected:
+    # it runs in the engine and reaches the tray through the event bus.
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._refresh()
+
     # ── Tray ─────────────────────────────────────────────────────────────
 
     def _setup_tray(self) -> None:
-        self._tray = SystemTray(on_show=self._restore, on_quit=self._quit_with_summary)
+        self._tray = SystemTray(on_show=self._restore,
+                                on_quit=self._quit_with_summary,
+                                on_notification_clicked=self._open_context)
         self._tray.show()
+
+    def _open_context(self, context: str) -> None:
+        """Open the tab that explains the notification just clicked."""
+        tab = {"threats": self.threats_view, "devices": self.device_list,
+               "events": self.event_list}.get(context)
+        if tab is not None:
+            self.tabs.setCurrentWidget(tab)
 
     def _restore(self) -> None:
         self.showNormal()
@@ -246,7 +279,7 @@ class Dashboard(QMainWindow):
     def _setup_auto_profile(self) -> None:
         from maze.network.auto_profile import AutoProfileWatcher
         self._auto_watcher = AutoProfileWatcher(
-            self.cfg.interface,
+            self.engine.identity,
             self.cfg.trusted_networks,
             self._on_auto_profile,
         )
@@ -268,26 +301,51 @@ class Dashboard(QMainWindow):
             if p == profile:
                 if self.profile_combo.currentIndex() != i:
                     self.profile_combo.setCurrentIndex(i)
+                    # Say what just happened, once per actual switch — never
+                    # on a re-evaluation that lands on the same profile, so a
+                    # login on the usual network stays silent. The public
+                    # message carries the one action worth knowing: how to
+                    # make this network trusted if it is in fact yours.
+                    net = self.engine.identity.network_id or ""
+                    label = net.split(":", 1)[1] if ":" in net else net
+                    if profile == Profile.PUBLIC:
+                        self._tray.notify_warning(
+                            self.state.t("notif_profile_public_title"),
+                            self.state.t("notif_profile_public_body").format(net=label),
+                            context="events")
+                    elif profile == Profile.HOME:
+                        self._tray.notify_warning(
+                            self.state.t("notif_profile_home_title"),
+                            self.state.t("notif_profile_home_body").format(net=label),
+                            context="events")
                 break
 
     # ── Refresh timer ────────────────────────────────────────────────────
 
     def _setup_timer(self) -> None:
         self._timer = QTimer(self)
-        self._timer.setInterval(5000)
+        self._timer.setInterval(10000)
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
+        # Switching tabs should not wait for the next tick.
+        self.tabs.currentChanged.connect(lambda _i: self._refresh())
 
     def _refresh(self) -> None:
+        if not self.isVisible():
+            return
+        # Only the tab on screen is worth a round trip: the connection map
+        # walks /proc through the helper and the protection tab re-reads the
+        # firewall, and a hidden tab redraws nothing anyone can see.
         monitor = self.engine.process_monitor
-        if monitor:
+        if monitor and self.conn_map.isVisible():
             asyncio.ensure_future(self._refresh_connections(monitor))
 
         watcher = self.engine.arp_watcher
-        if watcher:
+        if watcher and self.device_list.isVisible():
             self.device_list.update_devices(watcher.devices)
 
-        self.module_status.refresh()
+        if self.module_status.isVisible():
+            self.module_status.refresh()
 
     async def _refresh_connections(self, monitor) -> None:
         conns = await monitor.snapshot()
@@ -305,25 +363,120 @@ class Dashboard(QMainWindow):
                 self.device_list.update_devices(watcher.devices)
             return
 
+        if event.type == EventType.DEVICE_NEW:
+            # Worth interrupting someone for, but not an attack: it must not
+            # colour the threat header, which is reserved for things aimed at
+            # this host.
+            self.event_list.add_event(event)
+            self.dash_view.increment_event_count()
+            watcher = self.engine.arp_watcher
+            if watcher:
+                self.device_list.update_devices(watcher.devices)
+            if self._new_device_popup_allowed(event):
+                self._tray.notify_warning(
+                    self.state.t("notif_new_device"), event.message,
+                    context="devices")
+            return
+
         self.event_list.add_event(event)
         self.dash_view.increment_event_count()
 
         if event.level == ThreatLevel.DANGEROUS:
-            self.threat_widget.update_level(ThreatLevel.DANGEROUS)
-            self.dash_view.update_threat_level(ThreatLevel.DANGEROUS)
-            if self._may_notify(ThreatLevel.DANGEROUS):
+            self._raise_threat_level(ThreatLevel.DANGEROUS)
+            if self._may_notify(ThreatLevel.DANGEROUS) and \
+                    self._popup_allowed(event):
                 self._tray.notify_danger(
                     self.state.t("notif_danger_title"),
-                    event.message,
+                    event.message, context="threats",
                 )
         elif event.level == ThreatLevel.SUSPICIOUS:
-            self.threat_widget.update_level(ThreatLevel.SUSPICIOUS)
-            self.dash_view.update_threat_level(ThreatLevel.SUSPICIOUS)
-            if self._may_notify(ThreatLevel.SUSPICIOUS):
+            self._raise_threat_level(ThreatLevel.SUSPICIOUS)
+            if self._may_notify(ThreatLevel.SUSPICIOUS) and \
+                    self._popup_allowed(event):
                 self._tray.notify_warning(
                     self.state.t("notif_warn_title"),
-                    event.message,
+                    event.message, context="events",
                 )
+
+    # A "new device" popup is the signal a HOME user wants: someone joined my
+    # network. On a public network it is the opposite of a signal — strangers'
+    # phones (most with randomised MACs) come and go all day, and every one of
+    # them is "new". A café session used to produce a popup per arrival. Two
+    # guards, both leaving the event list and Devices tab fully populated:
+    #   * the untrusted-network profiles (PUBLIC, PARANOID, SECURE) never pop
+    #     for new devices — those profiles exist precisely because the network
+    #     is full of strangers;
+    #   * on any other profile a burst is damped per network: after
+    #     _NEWDEV_BURST popups within _NEWDEV_WINDOW, one last popup says the
+    #     rest are being logged silently, then nothing for _NEWDEV_MUTE. A
+    #     home network with three family phones never hits it; a hotspot with
+    #     a manually chosen Home profile does, once.
+    _NEWDEV_WINDOW = 600.0
+    _NEWDEV_BURST = 2
+    _NEWDEV_MUTE = 3600.0
+
+    def _new_device_popup_allowed(self, event: Event) -> bool:
+        if not getattr(self.cfg, "notify_new_devices", True):
+            return False
+        if self.engine.profiles.current in _UNTRUSTED_PROFILES:
+            return False
+        net = (event.data or {}).get("network_id", "")
+        now = time.monotonic()
+        if net != self._newdev_net:
+            self._newdev_net = net
+            self._newdev_times = []
+            self._newdev_muted_until = 0.0
+        if now < self._newdev_muted_until:
+            return False
+        self._newdev_times = [t for t in self._newdev_times
+                              if now - t < self._NEWDEV_WINDOW]
+        self._newdev_times.append(now)
+        if len(self._newdev_times) > self._NEWDEV_BURST:
+            self._newdev_muted_until = now + self._NEWDEV_MUTE
+            self._tray.notify_warning(
+                self.state.t("notif_new_device"),
+                self.state.t("notif_new_devices_muted"), context="devices")
+            return False
+        return True
+
+    # The same finding about the same source pops up once per _POPUP_REPEAT,
+    # and no more than _POPUP_BURST popups of any kind in _POPUP_WINDOW. A
+    # detector that misfires — or an attacker who trips one deliberately —
+    # must not bury the desktop in identical notifications; every event still
+    # lands in the event list.
+    _POPUP_REPEAT = 600.0
+    _POPUP_WINDOW = 60.0
+    _POPUP_BURST = 3
+
+    def _popup_allowed(self, event: Event) -> bool:
+        data = event.data or {}
+        source = (data.get("src") or data.get("ip") or data.get("hostname")
+                  or data.get("domain") or data.get("bssid")
+                  or data.get("process") or "")
+        key = (event.type, str(source))
+        now = time.monotonic()
+        if now - self._popup_last.get(key, -self._POPUP_REPEAT) < self._POPUP_REPEAT:
+            return False
+        self._popup_times = [t for t in self._popup_times
+                             if now - t < self._POPUP_WINDOW]
+        if len(self._popup_times) >= self._POPUP_BURST:
+            return False
+        self._popup_last[key] = now
+        self._popup_times.append(now)
+        if len(self._popup_last) > 512:
+            for old in sorted(self._popup_last,
+                              key=self._popup_last.get)[:256]:
+                del self._popup_last[old]
+        return True
+
+    def _raise_threat_level(self, level: ThreatLevel) -> None:
+        """Show the worst level seen since the last reset, not the newest."""
+        raised = escalate(self._threat_level, level)
+        if raised is self._threat_level:
+            return
+        self._threat_level = raised
+        self.threat_widget.update_level(raised)
+        self.dash_view.update_threat_level(raised)
 
     def _may_notify(self, level: ThreatLevel) -> bool:
         """Whether ``level`` is allowed to raise a desktop popup.
@@ -349,6 +502,7 @@ class Dashboard(QMainWindow):
             self.showMaximized()
 
     def _reset_threat(self) -> None:
+        self._threat_level = ThreatLevel.SAFE
         self.threat_widget.update_level(ThreatLevel.SAFE)
         self.dash_view.reset_threat_level()
 

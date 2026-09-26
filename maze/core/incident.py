@@ -18,11 +18,19 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from maze.core import posture
 from maze.core.events import Event, EventType, ThreatLevel
 from maze.utils.logger import log
 
-DATA_DIR = Path(os.environ.get("MAZE_DATA_DIR",
+def default_data_dir() -> Path:
+    """Where dossiers live. Read per call, not once at import, so a test (or a
+    packaged run with a different HOME) can point it somewhere else without
+    depending on module import order."""
+    return Path(os.environ.get("MAZE_DATA_DIR",
                                Path.home() / ".local" / "share" / "maze-guard"))
+
+
+DATA_DIR = default_data_dir()   # snapshot, for callers that read it directly
 
 # How much each kind of observation says about hostile intent. ARP spoofing and
 # a full port scan are attacks; an unknown process or a single odd TLS cert is
@@ -31,6 +39,7 @@ SCORE_WEIGHTS: dict[EventType, float] = {
     EventType.ARP_SPOOF:       45.0,
     EventType.ROGUE_AP:        40.0,
     EventType.ROGUE_DHCP:      40.0,
+    EventType.ROGUE_RA:        40.0,
     EventType.DNS_SPOOF:       40.0,
     EventType.SSL_STRIP:       35.0,
     EventType.PORT_SCAN:       25.0,
@@ -41,6 +50,23 @@ SCORE_WEIGHTS: dict[EventType, float] = {
     EventType.UNKNOWN_PROCESS:  3.0,
     EventType.RECON_RESULT:     0.0,
     EventType.DEVICE_FOUND:     0.0,
+}
+
+# Events we emit about our own response to a source. They belong in the
+# timeline (an audit trail of what we did is the point of the dossier) but not
+# in `techniques`, which answers "what did this host do to us" — listing
+# ip_blocked and recon_result there described our behaviour as theirs.
+_OWN_ACTIONS = {
+    EventType.IP_BLOCKED, EventType.RECON_RESULT, EventType.FIREWALL_CHANGED,
+}
+
+# Events that name a host without alleging anything about it. A dossier is a
+# record of hostility; opening one for "a device joined the network" would put
+# every phone in the house on the Threats tab.
+_NEVER_FILED = {
+    EventType.DEVICE_FOUND, EventType.DEVICE_NEW, EventType.IP_MOVED,
+    EventType.ENGINE_READY,
+    EventType.MODULE_TOGGLED, EventType.PROFILE_CHANGED,
 }
 
 # Score halves after this long without any new activity, so a host that
@@ -101,14 +127,21 @@ class Attacker:
     raw_score: float = 0.0
     scored_at: datetime = field(default_factory=datetime.now)
     techniques: set = field(default_factory=set)
-    ports_targeted: set = field(default_factory=set)
+    ports_targeted: set = field(default_factory=set)   # bounded sample
+    ports_probed: int = 0                              # true distinct count
     open_ports: list = field(default_factory=list)
     banners: dict = field(default_factory=dict)
     packets: int = 0
     blocked: bool = False
+    post_block: dict = field(default_factory=dict)   # traffic the block ate
     recon: dict = field(default_factory=dict)
     actions: list = field(default_factory=list)
     evidence: deque = field(default_factory=lambda: deque(maxlen=_MAX_EVIDENCE))
+    # What the rest of the Maze suite was doing when this source first turned
+    # hostile — see core/posture.py. Captured once, at that moment, and never
+    # refreshed: the value of the answer is that it describes the attack, not
+    # the machine as it stands now.
+    posture: dict = field(default_factory=dict)
 
     # ── scoring ───────────────────────────────────────────────────────────
 
@@ -145,10 +178,13 @@ class Attacker:
             "score": self.score(), "severity": self.severity,
             "techniques": sorted(self.techniques),
             "ports_targeted": sorted(self.ports_targeted),
+            "ports_probed": self.ports_probed,
             "open_ports": self.open_ports, "banners": _jsonable(self.banners),
             "packets": self.packets, "blocked": self.blocked,
+            "post_block": _jsonable(self.post_block),
             "recon": _jsonable(self.recon), "actions": self.actions,
             "evidence": [e.to_dict() for e in self.evidence],
+            "posture": _jsonable(self.posture),
         }
 
     @staticmethod
@@ -164,12 +200,15 @@ class Attacker:
         a.scored_at = _parse_ts(d.get("scored_at", d.get("last_seen")))
         a.techniques = set(d.get("techniques", []))
         a.ports_targeted = set(d.get("ports_targeted", []))
+        a.ports_probed = int(d.get("ports_probed", 0) or 0)
         a.open_ports = d.get("open_ports", [])
         a.banners = d.get("banners", {})
         a.packets = int(d.get("packets", 0))
         a.blocked = bool(d.get("blocked", False))
+        a.post_block = d.get("post_block", {}) or {}
         a.recon = d.get("recon", {})
         a.actions = d.get("actions", [])
+        a.posture = d.get("posture", {}) or {}
         for ev in d.get("evidence", [])[-_MAX_EVIDENCE:]:
             a.evidence.append(Evidence.from_dict(ev))
         return a
@@ -200,9 +239,12 @@ class Attacker:
         ]
         if self.ports_targeted:
             ports = sorted(self.ports_targeted)
+            total = max(self.ports_probed, len(ports))
             shown = ", ".join(str(p) for p in ports[:40])
             more = f" (+{len(ports) - 40} more)" if len(ports) > 40 else ""
-            lines.append(f"- Ports probed on us ({len(ports)}): {shown}{more}")
+            lines.append(f"- Ports probed on us ({total}): {shown}{more}")
+            if total > len(ports):
+                lines.append(f"  (list is a {len(ports)}-port sample of {total})")
         if self.open_ports:
             lines.append("")
             lines.append("## Services exposed by the source")
@@ -211,6 +253,28 @@ class Attacker:
                               else (entry, "?"))
                 banner = self.banners.get(str(port)) or self.banners.get(port)
                 lines.append(f"- {port}/{name}" + (f" — {banner}" if banner else ""))
+        if self.post_block.get("packets"):
+            pb = self.post_block
+            lines.append("")
+            lines.append("## After the block")
+            lines.append(f"- Packets dropped: {pb['packets']}")
+            if pb.get("protocols"):
+                lines.append(f"- Protocols:       {', '.join(pb['protocols'])}")
+            if pb.get("ports"):
+                ports = pb["ports"]
+                shown = ", ".join(str(p) for p in ports[:40])
+                more = f" (+{len(ports) - 40} more)" if len(ports) > 40 else ""
+                lines.append(f"- Ports attempted: {shown}{more}")
+            if pb.get("last"):
+                lines.append(f"- Last attempt:    {pb['last']}")
+
+        stance = posture.describe(self.posture)
+        if stance:
+            lines.append("")
+            lines.append("## Your defences at the time")
+            for line in stance:
+                lines.append(f"- {line}")
+
         if self.actions:
             lines.append("")
             lines.append("## Actions taken")
@@ -233,7 +297,7 @@ class IncidentStore:
     """
 
     def __init__(self, data_dir: Path | None = None, autosave: bool = True):
-        self._dir = Path(data_dir) if data_dir else DATA_DIR
+        self._dir = Path(data_dir) if data_dir else default_data_dir()
         self._attackers: dict[str, Attacker] = {}
         self._lock = threading.RLock()
         self._autosave = autosave
@@ -259,6 +323,8 @@ class IncidentStore:
         Returns the updated Attacker, or None when the event names no source
         (module toggles, profile switches and the like).
         """
+        if event.type in _NEVER_FILED:
+            return None
         ip = _source_of(event)
         if not ip:
             return None
@@ -272,6 +338,15 @@ class IncidentStore:
             if att is None:
                 att = Attacker(ip=ip, first_seen=now, last_seen=now,
                                scored_at=now)
+                # Record the defensive posture at the moment this source first
+                # did something hostile. capture() is cached, so a burst of
+                # events from one scan costs a single read. It also promises
+                # not to raise — but filing the attack matters more than the
+                # promise holding, so the call site does not rely on it.
+                try:
+                    att.posture = posture.capture()
+                except Exception as exc:      # pragma: no cover - defensive
+                    log.warning(f"incident: posture capture failed: {exc}")
                 self._attackers[ip] = att
             att.last_seen = max(att.last_seen, now)
 
@@ -280,15 +355,24 @@ class IncidentStore:
             att.hostname = data.get("hostname") or att.hostname
             att.vendor = data.get("vendor") or att.vendor
             att.os_hint = data.get("os_hint") or att.os_hint
-            if data.get("technique"):
-                att.techniques.add(str(data["technique"]))
-            else:
-                att.techniques.add(event.type.value)
+            if event.type not in _OWN_ACTIONS:
+                if data.get("technique"):
+                    att.techniques.add(str(data["technique"]))
+                else:
+                    att.techniques.add(event.type.value)
             for p in data.get("ports", []) or []:
                 try:
                     att.ports_targeted.add(int(p))
                 except (TypeError, ValueError):
                     pass
+            # `ports` is a bounded sample of what the detector saw; the true
+            # count rides along separately so the dossier never reports fewer
+            # ports than the alert that raised it.
+            att.ports_probed = max(
+                att.ports_probed,
+                int(data.get("unique_ports", 0) or 0),
+                len(att.ports_targeted),
+            )
             att.packets += int(data.get("packets", 0) or 0)
 
             # A repeat of the same technique is worth less than a new one: the
@@ -342,6 +426,29 @@ class IncidentStore:
         # An action is a decision we took, not just something we observed:
         # write it out immediately rather than waiting for the next tick.
         self._maybe_save(force=True)
+
+    def record_blocked_traffic(self, ip: str, traffic: dict) -> None:
+        """Merge one window of drop-rule hits into an existing dossier.
+
+        Counts accumulate across polls; ports are unioned. Nothing is created
+        here — evidence about a host we are not already tracking would have no
+        incident to belong to.
+        """
+        with self._lock:
+            att = self._attackers.get(ip)
+            if att is None or not traffic.get("packets"):
+                return
+            pb = att.post_block or {}
+            pb["packets"] = int(pb.get("packets", 0)) + int(traffic["packets"])
+            ports = set(pb.get("ports", [])) | set(traffic.get("ports", []))
+            pb["ports"] = sorted(ports)[:64]
+            pb["protocols"] = sorted(set(pb.get("protocols", []))
+                                     | set(traffic.get("protocols", [])))
+            pb["first"] = pb.get("first") or traffic.get("first", "")
+            pb["last"] = traffic.get("last") or pb.get("last", "")
+            att.post_block = pb
+            self._dirty = True
+        self._maybe_save()
 
     def mark_blocked(self, ip: str, blocked: bool = True) -> None:
         with self._lock:

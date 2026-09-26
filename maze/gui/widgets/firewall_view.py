@@ -41,7 +41,7 @@ class FirewallView(QWidget):
         self._build_ui()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(4000)
+        self._timer.setInterval(10000)
         self._timer.timeout.connect(self._refresh)
         self._timer.start()
         QTimer.singleShot(200, self._refresh)
@@ -125,7 +125,15 @@ class FirewallView(QWidget):
     # ── refresh ────────────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
+        # Each refresh is a firewall-cmd round trip through the helper — not
+        # worth it while hidden (tray, or another tab). showEvent catches up.
+        if not self.isVisible():
+            return
         asyncio.ensure_future(self._async_refresh())
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._refresh()
 
     async def _async_refresh(self) -> None:
         rules = await self._engine.list_fw_rules()

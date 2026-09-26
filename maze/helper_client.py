@@ -141,11 +141,26 @@ class HelperClient:
         r = await self._send({"cmd": "fw_cmd", "args": args}, timeout=120.0)
         return bool(r.get("ok"))
 
-    async def fw_state(self) -> dict:
+    async def fw_state(self) -> dict | None:
         """Snapshot of the firewall backend: installed/running/enabled, default
-        zone, its target and panic mode. Empty dict when unavailable."""
+        zone, its target and panic mode.
+
+        Three answers, because callers must treat them differently:
+          dict  — the state;
+          {}    — a daemon older than fw_state (it ignores the command or says
+                  "unknown command"): fall back to what old daemons support;
+          None  — the daemon has fw_state but could not answer just now (a
+                  timeout, a probe that failed, the connection dropping). That
+                  is NOT an old daemon, and reporting it as one sent people to
+                  restart a helper that was up to date.
+        """
         r = await self._send({"cmd": "fw_state"})
-        return r.get("data", {}) if r.get("ok") else {}
+        if r.get("ok"):
+            return r.get("data", {})
+        err = str(r.get("err") or "")
+        if not err or err.startswith("unknown command"):
+            return {}
+        return None
 
     async def fw_service(self, action: str) -> tuple[bool, str]:
         """Drive the firewalld unit (start/stop/restart/is-active/...).
@@ -169,8 +184,11 @@ class HelperClient:
                           "service control — reinstall to update the daemon")
 
     async def fw_list(self) -> dict:
+        empty = {"ips": [], "ports_tcp": [], "ports_udp": [], "macs": []}
         r = await self._send({"cmd": "fw_list"})
-        return r.get("data", {"ips": [], "ports_tcp": [], "ports_udp": []}) if r.get("ok") else {"ips": [], "ports_tcp": [], "ports_udp": []}
+        if not r.get("ok"):
+            return empty
+        return {**empty, **(r.get("data") or {})}
 
     async def svc(self, action: str, unit: str) -> tuple[bool, str]:
         """Run an allowlisted systemctl action. Returns (ok, stdout)."""
@@ -181,6 +199,16 @@ class HelperClient:
         """Full connection→process map built root-side, or None if unavailable."""
         r = await self._send({"cmd": "proc_conns"})
         return r.get("data") if r.get("ok") else None
+
+    async def capture_stats(self) -> dict:
+        """How much traffic the daemon's capture has seen since it started.
+
+        Empty dict when the running daemon is too old to answer — callers must
+        treat that as "cannot tell", never as zero, since zero is the one
+        reading that would be actively misleading.
+        """
+        r = await self._send({"cmd": "capture_stats"})
+        return r.get("data", {}) if r.get("ok") else {}
 
     async def sysctl_get(self, key: str) -> str | None:
         r = await self._send({"cmd": "sysctl_get", "key": key})

@@ -5,30 +5,27 @@ import struct
 import subprocess
 import time
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
+from maze.core.verify import FAIL, PASS, Verdict, WARN, merge
+from maze.utils.ipaddr import is_private
 from maze.utils.logger import log
 
 _IPV4_RE = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
 
+# TEST-NET-2 (RFC 5737): reserved for documentation, routed nowhere, and
+# certainly not anybody's configured resolver — which is exactly what the
+# self-test needs to push through the rule without inventing a real one.
+_PROBE_RESOLVER = "198.51.100.53"
+
 
 def _is_private_ip(ip: str) -> bool:
-    """True for RFC 1918, loopback, link-local, and unspecified addresses."""
-    if ip in ("0.0.0.0", "255.255.255.255"):
-        return True
-    if ip.startswith("127.") or ip.startswith("169.254."):
-        return True
-    if ip.startswith("10."):
-        return True
-    if ip.startswith("192.168."):
-        return True
-    try:
-        parts = ip.split(".")
-        if len(parts) == 4 and parts[0] == "172":
-            second = int(parts[1])
-            if 16 <= second <= 31:
-                return True
-    except (ValueError, IndexError):
-        pass
-    return False
+    """True for anything that can only exist on a local network.
+
+    Kept as a module-level name because half the application imports it from
+    here; the implementation lives in maze.utils.ipaddr, which answers for IPv6
+    as well — the prefix-matching version this replaced treated every IPv6
+    address, including an attacker's link-local one, as remote.
+    """
+    return is_private(ip)
 
 
 def _get_configured_dns_servers() -> set[str]:
@@ -180,34 +177,162 @@ def _read_udp_dns_destinations() -> list[str]:
 
 class DNSLeakPreventer:
     """
-    Detects plaintext DNS traffic leaking outside the expected resolver.
+    Detect plaintext DNS traffic escaping the resolver it is supposed to use.
 
-    Without VPN: warns only if DNS goes to a public IP not listed in
-    /etc/resolv.conf (possible DNS hijack). Private IPs are never flagged
-    without VPN since the home router DNS is normal.
+    Two sources feed the same judgement:
 
-    With VPN active: a DNS query is only a leak if it actually egresses via a
-    non-VPN interface (checked against the routing table). Queries that route
-    through the tunnel — including ones to public resolvers like 9.9.9.9 — are
-    legitimate under a full-tunnel VPN and are not flagged.
+    * **Live capture** (when the privileged helper is connected). Every UDP/53
+      packet leaving this host is examined as it happens. This is what makes
+      the module work at all for ordinary applications: a DNS query and its
+      answer are over in milliseconds, so the socket that carried them is gone
+      long before any poll comes round. Polling could only ever catch the
+      long-lived socket systemd-resolved keeps to its upstream — which is why
+      a browser resolving names on its own used to sail past unnoticed.
+    * **/proc/net/udp poll** every 60 s, kept as the fallback for when the
+      helper is unavailable, and as a backstop for sockets held open.
 
-    VPN state changes reset the warned-IPs set so a reconnect can surface
-    new leaks that weren't present in the previous session.
+    The verdict itself is unchanged:
+
+    Without VPN: warn only if DNS goes to a public address that appears in
+    neither /etc/resolv.conf nor the resolver daemon's own upstream list — a
+    real hijack points you at a resolver you never configured. Private
+    addresses are never flagged without a VPN, since the home router is normal.
+
+    With VPN active: a query is a leak only if it actually egresses through a
+    non-VPN interface, checked against the routing table. Queries that route
+    through the tunnel — including ones to public resolvers such as 9.9.9.9 —
+    are legitimate under a full tunnel and are not flagged.
     """
+
+    # How long a resolver-configuration snapshot is reused. Reading it costs
+    # three subprocesses, and a per-packet check cannot afford that; the
+    # configuration itself changes on the timescale of a network switch.
+    _CONFIG_TTL = 30.0
+    # Don't re-judge the same destination more often than this.
+    _JUDGE_TTL = 30.0
+    # Don't repeat a warning about one address inside this window.
+    _WARN_TTL = 1800.0
 
     def __init__(self):
         self._task: asyncio.Task | None = None
         self._bus = None
-        self._warned: dict[str, float] = {}  # ip -> timestamp
+        self._helper = None
+        self._warned: dict[str, float] = {}       # ip -> timestamp
+        self._judged: dict[str, float] = {}       # ip -> timestamp
         self._last_vpn_state: frozenset[str] = frozenset()
+        self._config: tuple | None = None         # cached resolver picture
+        self._config_at: float = 0.0
+        self._live = False                        # capture feed available
+        self._queries = 0                         # observed outbound queries
 
-    async def start(self, bus) -> None:
+    # ── lifecycle ────────────────────────────────────────────────────────
+
+    async def start(self, bus, helper=None) -> None:
         self._bus = bus
+        self._helper = helper
+        self._live = bool(helper and helper.is_connected())
+        if self._live:
+            helper.on_event(self._on_helper_event)
+        else:
+            log.warning("DNSLeakPreventer: helper unavailable — falling back "
+                        "to /proc polling, which only sees long-lived sockets")
         self._task = asyncio.create_task(self._monitor())
 
     async def stop(self) -> None:
+        if self._helper is not None:
+            self._helper.off_event(self._on_helper_event)
         if self._task:
             self._task.cancel()
+        self._task = None
+
+    # ── what the interface shows ─────────────────────────────────────────
+
+    def status_detail(self) -> str:
+        if not self._live:
+            return ("no packet capture — only DNS sockets held open long "
+                    "enough to be polled are seen")
+        if not self._queries:
+            return "watching outbound DNS live; none seen yet"
+        return f"watching outbound DNS live; {self._queries} queries examined"
+
+    # ── self-test ────────────────────────────────────────────────────────
+
+    async def verify(self) -> Verdict:
+        """Prove the rule fires, and say whether anything is feeding it."""
+        rule = await asyncio.to_thread(self._verify_rule)
+        feed = self._verify_feed()
+        return merge(rule, feed)
+
+    def _verify_rule(self) -> Verdict:
+        """Run a fabricated unconfigured resolver through the real judgement."""
+        configured, upstreams, vpn = self._resolver_picture()
+        picture = [
+            f"resolv.conf: {', '.join(sorted(configured)) or 'none'}",
+            f"resolver daemon upstreams: "
+            f"{', '.join(sorted(upstreams)) or 'none'}",
+            f"VPN: {', '.join(vpn) if vpn else 'not active'}",
+        ]
+        verdict = self._judge(_PROBE_RESOLVER)
+        if verdict:
+            return Verdict(PASS,
+                           f"the rule fires: a query to an unconfigured "
+                           f"resolver ({_PROBE_RESOLVER}) is judged a leak",
+                           picture + [verdict])
+        if vpn:
+            # Under a full tunnel this is the right answer, not a failure: the
+            # query would leave through the VPN, which is where it belongs.
+            return Verdict(PASS,
+                           f"the rule fires: a query to {_PROBE_RESOLVER} "
+                           f"would route through the tunnel, so it is correctly "
+                           f"not a leak — a query leaving around the tunnel "
+                           f"would be", picture)
+        return Verdict(FAIL,
+                       f"the rule did NOT flag a query to {_PROBE_RESOLVER}, "
+                       f"an address that is in no resolver configuration on "
+                       f"this machine — leak detection is not working",
+                       picture)
+
+    def _verify_feed(self) -> Verdict:
+        if not self._live:
+            return Verdict(WARN,
+                           "no packet capture: only DNS sockets still open when "
+                           "the 60-second poll comes round can be seen, which "
+                           "an application's own query never is")
+        if not self._queries:
+            return Verdict(WARN,
+                           "live capture is attached but no DNS query has been "
+                           "observed yet — resolve a name and test again")
+        return Verdict(PASS,
+                       f"live capture is attached: {self._queries} outbound DNS "
+                       f"queries examined as they left this machine")
+
+    # ── live capture feed ────────────────────────────────────────────────
+
+    async def _on_helper_event(self, msg: dict) -> None:
+        if msg.get("event") != "dns":
+            return
+        # Only queries leaving this host, and only ones addressed to a resolver
+        # (destination port 53). An answer coming back tells us nothing the
+        # question did not.
+        if not msg.get("outbound") or int(msg.get("dport", 0)) != 53:
+            return
+        ip = msg.get("dst", "")
+        if not ip:
+            return
+        self._queries += 1
+        now = time.monotonic()
+        if now - self._judged.get(ip, -self._JUDGE_TTL) < self._JUDGE_TTL:
+            return
+        self._judged[ip] = now
+        try:
+            verdict = await asyncio.to_thread(self._judge, ip)
+        except Exception as exc:
+            log.debug(f"DNSLeakPreventer: could not judge {ip}: {exc}")
+            return
+        if verdict:
+            await self._report(ip, verdict)
+
+    # ── polling fallback ─────────────────────────────────────────────────
 
     async def _monitor(self) -> None:
         while True:
@@ -215,71 +340,86 @@ class DNSLeakPreventer:
             try:
                 leaks = await asyncio.to_thread(self._find_leaks)
                 for ip, msg in leaks:
-                    now = time.monotonic()
-                    if ip not in self._warned or now - self._warned[ip] > 1800:
-                        self._warned[ip] = now
-                        await self._bus.emit(Event(
-                            type=EventType.DNS_LEAK,
-                            level=ThreatLevel.SUSPICIOUS,
-                            message=msg,
-                            data={"ip": ip},
-                        ))
+                    await self._report(ip, msg)
             except Exception as exc:
                 log.warning(f"DNSLeakPreventer check error: {exc}")
 
     def _find_leaks(self) -> list[tuple[str, str]]:
         leaks: list[tuple[str, str]] = []
-        destinations = _read_udp_dns_destinations()
-        if not destinations:
-            return leaks
+        for ip in _read_udp_dns_destinations():
+            verdict = self._judge(ip)
+            if verdict:
+                leaks.append((ip, verdict))
+        return leaks
+
+    # ── judgement ────────────────────────────────────────────────────────
+
+    async def _report(self, ip: str, message: str) -> None:
+        now = time.monotonic()
+        if now - self._warned.get(ip, -self._WARN_TTL) < self._WARN_TTL:
+            return
+        self._warned[ip] = now
+        await self._bus.emit(Event(
+            type=EventType.DNS_LEAK,
+            level=ThreatLevel.SUSPICIOUS,
+            message=message,
+            data={"ip": ip},
+        ))
+
+    def _resolver_picture(self) -> tuple[set[str], set[str], list[str]]:
+        """(resolv.conf servers, daemon upstreams, VPN interfaces), cached.
+
+        Blocking — call from a thread. A VPN coming up or going down clears the
+        warned set, so a reconnect can surface leaks the previous session had
+        already reported and fallen silent about.
+        """
+        now = time.monotonic()
+        if self._config is not None and now - self._config_at < self._CONFIG_TTL:
+            return self._config
 
         configured = _get_configured_dns_servers()
-        resolved_upstreams = (
-            _get_resolved_upstreams()
-            | _get_resolved_fallback()
-            | _get_nm_dns_servers()
-        )
+        upstreams = (_get_resolved_upstreams()
+                     | _get_resolved_fallback()
+                     | _get_nm_dns_servers())
         vpn_ifaces = _get_active_vpn_interfaces()
-        vpn_state = frozenset(vpn_ifaces)
 
-        # VPN state changed (connected / disconnected / switched server):
-        # clear warned set so new leaks surface immediately.
+        vpn_state = frozenset(vpn_ifaces)
         if vpn_state != self._last_vpn_state:
             self._warned.clear()
+            self._judged.clear()
             self._last_vpn_state = vpn_state
 
-        vpn_active = bool(vpn_ifaces)
-        vpn_set = set(vpn_ifaces)
+        self._config = (configured, upstreams, vpn_ifaces)
+        self._config_at = now
+        return self._config
 
-        for ip in destinations:
-            if ip in configured:
-                continue  # goes to expected resolver
+    def _judge(self, ip: str) -> str | None:
+        """Why ``ip`` is a leak, or None if this query is expected.
 
-            if vpn_active:
-                # A DNS query is a leak only if it actually leaves via a
-                # non-VPN interface. The destination alone doesn't tell us that
-                # — a full-tunnel VPN routes even public resolvers (9.9.9.9,
-                # 1.1.1.1) out through the tunnel, which is fine. Consult the
-                # routing table for the real egress path.
-                egress = _dns_egress_iface(ip)
-                if egress is None or egress in vpn_set:
-                    continue  # routed through the tunnel (or unknown) → not a leak
-                msg = (
-                    f"DNS leak detected: query to {ip} egresses via '{egress}' "
-                    f"instead of the VPN tunnel ({', '.join(vpn_ifaces)})"
-                )
-                leaks.append((ip, msg))
-            else:
-                # No VPN: private IPs are your LAN/router DNS — normal, and
-                # systemd-resolved's configured upstreams (which never appear
-                # in resolv.conf, only the 127.0.0.53 stub does) are legit too.
-                # Flag only public IPs that match neither — a real hijack
-                # redirects you to a resolver you never configured.
-                if not _is_private_ip(ip) and ip not in resolved_upstreams:
-                    msg = (
-                        f"Unexpected DNS server: query to {ip} "
-                        f"(not in resolv.conf) — possible DNS hijack"
-                    )
-                    leaks.append((ip, msg))
+        Blocking (reads the routing table) — call from a thread.
+        """
+        configured, upstreams, vpn_ifaces = self._resolver_picture()
 
-        return leaks
+        if ip in configured:
+            return None                     # goes to the expected resolver
+
+        if vpn_ifaces:
+            # A DNS query is a leak only if it actually leaves via a non-VPN
+            # interface. The destination alone does not tell us that — a full
+            # tunnel routes even public resolvers (9.9.9.9, 1.1.1.1) out
+            # through itself, which is fine. Ask the routing table.
+            egress = _dns_egress_iface(ip)
+            if egress is None or egress in set(vpn_ifaces):
+                return None
+            return (f"DNS leak detected: query to {ip} egresses via "
+                    f"'{egress}' instead of the VPN tunnel "
+                    f"({', '.join(vpn_ifaces)})")
+
+        # No VPN: private addresses are your LAN/router DNS — normal — and the
+        # resolver daemon's configured upstreams (which never appear in
+        # resolv.conf, only the 127.0.0.53 stub does) are legitimate too. Flag
+        # only public addresses matching neither.
+        if not _is_private_ip(ip) and ip not in upstreams:
+            return (f"Unexpected DNS server: query to {ip} "
+                    f"(not in resolv.conf) — possible DNS hijack")
+        return None

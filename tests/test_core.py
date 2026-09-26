@@ -8,8 +8,10 @@ packets and a stub helper, so it can run anywhere.
 """
 import asyncio
 import os
+import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta
@@ -17,7 +19,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from maze.core.events import Event, EventBus, EventType, ThreatLevel  # noqa: E402
+os.environ.setdefault("MAZE_GUARD_LOG_FILE", "")  # never write the real ~/.config/maze/maze.log
+from maze.core.events import (                                        # noqa: E402
+    Event, EventBus, EventType, ThreatLevel, escalate,
+)
 from maze.core.incident import IncidentStore                # noqa: E402
 from maze.detection.anomaly import AnomalyDetector                    # noqa: E402
 from maze.protection.firewall import FirewallManager                  # noqa: E402
@@ -243,6 +248,69 @@ class TestAnomalyDetector(unittest.TestCase):
 
 # ── incident store ───────────────────────────────────────────────────────────
 
+class TestRogueRouterAdvert(unittest.TestCase):
+    """The IPv6 MITM: a forged Router Advertisement makes the attacker your
+    default router without a lease, a race, or a reply from anyone."""
+
+    def _detector(self, whitelist=None):
+        det = AnomalyDetector("test0", whitelist=whitelist or [])
+        det._bus = CollectingBus()
+        # Past the join burst, where a second router is expected (see
+        # test_network_noise for the burst itself).
+        det._epoch_started = time.monotonic() - 3600
+        return det
+
+    def _ra(self, src, lifetime=1800):
+        return {"event": "ra", "src": src, "dst": "ff02::1",
+                "lifetime": lifetime, "prf": 0}
+
+    def test_the_first_router_is_the_incumbent(self):
+        det = self._detector()
+        run(det._on_packet(self._ra("fe80::1")))
+        self.assertEqual(det._bus.events, [])
+
+    def test_a_second_router_is_reported(self):
+        det = self._detector()
+        run(det._on_packet(self._ra("fe80::1")))
+        run(det._on_packet(self._ra("fe80::666")))
+        events = [e for e in det._bus.events if e.type == EventType.ROGUE_RA]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0].level, ThreatLevel.DANGEROUS)
+        self.assertEqual(events[0].data["src"], "fe80::666")
+        self.assertEqual(events[0].data["technique"], "rogue_ra")
+
+    def test_the_incumbent_re_advertising_is_not_an_alert(self):
+        det = self._detector()
+        for _ in range(5):
+            run(det._on_packet(self._ra("fe80::1")))
+        self.assertEqual(det._bus.events, [])
+
+    def test_a_router_withdrawing_itself_is_not_a_new_router(self):
+        """Lifetime 0 is how a legitimate router leaves the link."""
+        det = self._detector()
+        run(det._on_packet(self._ra("fe80::1")))
+        run(det._on_packet(self._ra("fe80::2", lifetime=0)))
+        self.assertEqual(det._bus.events, [])
+
+    def test_a_whitelisted_router_is_ignored(self):
+        det = self._detector(whitelist=["fe80::666"])
+        run(det._on_packet(self._ra("fe80::1")))
+        run(det._on_packet(self._ra("fe80::666")))
+        self.assertEqual(det._bus.events, [])
+
+    def test_an_ipv6_scan_reaches_the_port_detector_unchanged(self):
+        """Addresses are opaque strings to the analysis: a v6 source flows
+        through the same counting and classification as a v4 one."""
+        det = PortScanDetector("test0", threshold=5)
+        det._bus = CollectingBus()
+        det._own_ips = {"fe80::42"}
+        for port in range(1, 20):
+            run(det._process("fe80::666", port, "S", "fe80::42"))
+        kinds = [e.type for e in det._bus.events]
+        self.assertIn(EventType.PORT_SCAN, kinds)
+        self.assertEqual(det._bus.events[0].data["src"], "fe80::666")
+
+
 class TestIncidentStore(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -295,6 +363,44 @@ class TestIncidentStore(unittest.TestCase):
         self.assertEqual(att.vendor, "VMware")
         self.assertEqual(att.open_ports, [[4444, "Metasploit?"]])
 
+    def test_our_own_responses_are_not_attacker_techniques(self):
+        """Blocking and scanning are things WE did — listing them under the
+        attacker's techniques described our behaviour as theirs."""
+        self.store.record(self._scan_event())
+        self.store.record(Event(
+            type=EventType.IP_BLOCKED, level=ThreatLevel.DANGEROUS,
+            message="Auto-blocked 10.0.0.99", data={"ip": "10.0.0.99"}))
+        self.store.record(Event(
+            type=EventType.RECON_RESULT, level=ThreatLevel.SUSPICIOUS,
+            message="Recon: 10.0.0.99", data={"ip": "10.0.0.99"}))
+        att = self.store.get("10.0.0.99")
+        self.assertEqual(att.techniques, {"syn_scan"})
+        # …but they stay in the timeline, which is the audit trail.
+        kinds = {e.kind for e in att.evidence}
+        self.assertIn("ip_blocked", kinds)
+        self.assertIn("recon_result", kinds)
+
+    def test_port_count_survives_a_truncated_payload(self):
+        """The detector sends a bounded sample of ports plus the real count;
+        the dossier must report the count, not the size of the sample."""
+        self.store.record(Event(
+            type=EventType.PORT_SCAN, level=ThreatLevel.DANGEROUS,
+            message="scan", data={"src": "10.0.0.99", "ports": [22, 80, 443],
+                                  "unique_ports": 75, "technique": "syn_scan"}))
+        att = self.store.get("10.0.0.99")
+        self.assertEqual(att.ports_probed, 75)
+        self.assertEqual(len(att.ports_targeted), 3)
+        self.assertIn("Ports probed on us (75)", att.report())
+        self.assertIn("sample of 75", att.report())
+
+    def test_port_count_never_goes_backwards(self):
+        for unique in (75, 12):
+            self.store.record(Event(
+                type=EventType.PORT_SCAN, level=ThreatLevel.DANGEROUS,
+                message="scan", data={"src": "10.0.0.99", "ports": [22],
+                                      "unique_ports": unique}))
+        self.assertEqual(self.store.get("10.0.0.99").ports_probed, 75)
+
     def test_dossiers_survive_a_restart(self):
         self.store.record(self._scan_event())
         self.store.mark_blocked("10.0.0.99")
@@ -331,6 +437,8 @@ class StubHelper:
                       "zone": zone, "target": target, "panic": False}
         self.calls: list[list[str]] = []
         self.accept = True
+        self.blocked_ips: list[str] = []
+        self.blocked_macs: list[str] = []
 
     def is_connected(self):
         return True
@@ -339,7 +447,8 @@ class StubHelper:
         return dict(self.state)
 
     async def fw_list(self):
-        return {"ips": [], "ports_tcp": [], "ports_udp": []}
+        return {"ips": list(self.blocked_ips), "ports_tcp": [], "ports_udp": [],
+                "macs": list(self.blocked_macs)}
 
     async def fw_list_all(self):
         return f"{self.state['zone']} (default, active)\n"
@@ -348,11 +457,21 @@ class StubHelper:
         self.calls.append(args)
         if not self.accept:
             return False
-        for arg in args:
+        for i, arg in enumerate(args):
             if arg == "--set-target=DROP":
                 self.state["target"] = "DROP"
             elif arg == "--set-target=default":
                 self.state["target"] = "default"
+            elif arg in ("--add-rich-rule", "--remove-rich-rule"):
+                rule = args[i + 1] if i + 1 < len(args) else ""
+                target = (self.blocked_macs if "source mac=" in rule
+                          else self.blocked_ips)
+                value = rule.split("=", 2)[-1].split(" ")[0] if "=" in rule else ""
+                if arg == "--add-rich-rule":
+                    if value and value not in target:
+                        target.append(value)
+                elif value in target:
+                    target.remove(value)
         return True
 
     async def fw_service(self, action):
@@ -377,6 +496,37 @@ class TestFirewallManager(unittest.TestCase):
         run(fw.start(None, helper=helper))
         return fw
 
+    def test_a_transient_state_failure_keeps_the_last_known_state(self):
+        """fw_state answering None (the helper could not read it just now) must
+        not flip a running firewall to "Unavailable" or "stopped"."""
+        helper = StubHelper(running=True, target="DROP", zone="home")
+        fw = self._manager(helper)
+        self.assertTrue(fw.state.running)
+
+        async def flaky():
+            return None
+        helper.fw_state = flaky
+        state = run(fw.sync_state())
+        self.assertTrue(state.installed)
+        self.assertTrue(state.running)
+        self.assertEqual(state.zone, "home")
+
+    def test_the_client_tells_an_old_daemon_from_a_failed_read(self):
+        from maze.helper_client import HelperClient
+        client = HelperClient.__new__(HelperClient)
+        for reply, want in (
+            ({"ok": True, "data": {"running": True}}, {"running": True}),
+            ({"ok": False}, {}),                                           # old daemon: ignores it
+            ({"ok": False, "err": "unknown command: fw_state"}, {}),       # old daemon: says so
+            ({"ok": False, "err": "could not read the firewalld state"}, None),
+            ({"ok": False, "err": "the helper did not answer within 6s"}, None),
+            ({"ok": False, "err": "helper not connected"}, None),
+        ):
+            async def send(cmd, timeout=6.0, _r=reply):
+                return dict(_r)
+            client._send = send
+            self.assertEqual(run(client.fw_state()), want, reply)
+
     def test_state_reflects_the_backend(self):
         fw = self._manager(StubHelper(running=True, target="DROP", zone="home"))
         self.assertTrue(fw.state.running)
@@ -393,6 +543,46 @@ class TestFirewallManager(unittest.TestCase):
         for call in helper.calls:
             if "--zone" in call:
                 self.assertEqual(call[call.index("--zone") + 1], "home")
+
+    def test_a_hardware_address_can_be_blocked(self):
+        """An IP block is walked around by a DHCP renewal; the MAC is the
+        device. firewalld's own parser accepts this rule form."""
+        helper = StubHelper()
+        fw = self._manager(helper)
+        self.assertTrue(run(fw.block_mac("AA:BB:CC:DD:EE:FF")))
+        rules = [c[c.index("--add-rich-rule") + 1] for c in helper.calls
+                 if "--add-rich-rule" in c]
+        self.assertEqual(len(rules), 1)
+        self.assertIn("source mac=aa:bb:cc:dd:ee:ff", rules[0])
+        self.assertTrue(rules[0].endswith("drop"))
+
+    def test_a_malformed_hardware_address_is_refused(self):
+        helper = StubHelper()
+        fw = self._manager(helper)
+        for bad in ("", "not-a-mac", "aa:bb:cc:dd:ee", "../../etc/passwd"):
+            self.assertFalse(run(fw.block_mac(bad)))
+        self.assertEqual([c for c in helper.calls if "--add-rich-rule" in c], [])
+
+    def test_unblocking_a_mac_removes_both_rule_spellings(self):
+        helper = StubHelper()
+        fw = self._manager(helper)
+        run(fw.unblock_mac("aa:bb:cc:dd:ee:ff"))
+        removed = [c[c.index("--remove-rich-rule") + 1] for c in helper.calls
+                   if "--remove-rich-rule" in c]
+        self.assertEqual(len(removed), 2)
+        self.assertTrue(any("log prefix=MAZE-BLOCK" in r for r in removed))
+        self.assertTrue(any("log prefix" not in r for r in removed))
+
+    def test_clearing_rules_also_clears_mac_blocks(self):
+        """A 'clear all' that leaves hardware blocks in place is a silent
+        block with nothing in the interface admitting to it."""
+        helper = StubHelper()
+        helper.blocked_macs = ["aa:bb:cc:dd:ee:ff"]
+        fw = self._manager(helper)
+        run(fw.flush())
+        removed = [c[c.index("--remove-rich-rule") + 1] for c in helper.calls
+                   if "--remove-rich-rule" in c]
+        self.assertTrue(any("source mac=aa:bb:cc:dd:ee:ff" in r for r in removed))
 
     def test_disable_shield_without_prior_init_still_uses_the_right_zone(self):
         helper = StubHelper(zone="internal", target="DROP")
@@ -453,7 +643,12 @@ class TestHelperRuleAllowlist(unittest.TestCase):
         spec.loader.exec_module(cls.helper)
 
     def _allowed(self, rule: str) -> bool:
-        return any(rx.match(rule) for rx in self.helper._FWC_RULE_RES)
+        # _fwc_rule_ok, not the regexes on their own: how much of the internet
+        # a CIDR covers is decided by its mask, which no regex can weigh, so
+        # that half of the check lives outside the patterns. Testing the
+        # patterns directly would pass while the real gate the dispatcher uses
+        # said something else.
+        return self.helper._fwc_rule_ok(rule)
 
     def test_maze_block_rules_are_accepted(self):
         for rule in (
@@ -461,7 +656,16 @@ class TestHelperRuleAllowlist(unittest.TestCase):
             "rule family=ipv4 source address=192.168.1.5 "
             "log prefix=MAZE-BLOCK level=info limit value=3/m drop",
             "rule family=ipv6 source address=fe80::1 drop",
+            # Hand-typed CIDRs from the Firewall tab. Narrowing the catch-all
+            # check must not cost the legitimate wide-ish blocks.
+            "rule family=ipv4 source address=10.0.0.0/8 drop",
+            "rule family=ipv4 source address=192.168.0.0/16 drop",
+            "rule family=ipv4 source address=192.168.1.5/24 drop",
+            "rule family=ipv6 source address=2001:db8::/32 drop",
             "rule family=ipv4 port port=23 protocol=tcp drop",
+            "rule source mac=aa:bb:cc:dd:ee:ff drop",
+            "rule source mac=AA:BB:CC:DD:EE:FF "
+            "log prefix=MAZE-BLOCK level=info limit value=3/m drop",
         ):
             self.assertTrue(self._allowed(rule), rule)
 
@@ -469,6 +673,19 @@ class TestHelperRuleAllowlist(unittest.TestCase):
         for rule in (
             "rule family=ipv4 source address=0.0.0.0/0 drop",
             "rule family=ipv6 source address=::/0 drop",
+            # A /0 is a /0 whatever address is written in front of it, and
+            # 0.0.0.0/1 plus 128.0.0.0/1 is the same black-hole in two rules.
+            # Refusing the literal strings "0.0.0.0" and "::" caught neither:
+            # adding a block needs no authorisation, removing one needs the
+            # polkit admin prompt, so these went on silently and stayed.
+            "rule family=ipv4 source address=1.2.3.4/0 drop",
+            "rule family=ipv4 source address=0.0.0.0/1 drop",
+            "rule family=ipv4 source address=128.0.0.0/1 drop",
+            "rule family=ipv4 source address=10.0.0.0/7 drop",
+            "rule family=ipv6 source address=2000::/0 drop",
+            "rule family=ipv6 source address=::/1 drop",
+            # Not an address at all — the old pattern's \d{1,3} accepted it.
+            "rule family=ipv4 source address=999.1.1.1 drop",
             "rule family=ipv4 source address=1.2.3.4 accept",
             "rule family=ipv4 source address=1.2.3.4 drop accept",
             "rule family=ipv4 source address=1.2.3.4 masquerade",
@@ -478,6 +695,10 @@ class TestHelperRuleAllowlist(unittest.TestCase):
             "log prefix=EVIL level=info limit value=3/m drop",
             "rule family=ipv4 source address=1.2.3.4 "
             "log prefix=MAZE-X level=emerg limit value=9999/s drop",
+            "rule source mac=aa:bb:cc:dd:ee:ff accept",
+            "rule source mac=aa:bb:cc:dd:ee:ff drop accept",
+            "rule source mac=not-a-mac drop",
+            "rule source mac=aa:bb:cc:dd:ee:ff masquerade",
         ):
             self.assertFalse(self._allowed(rule), rule)
 
@@ -577,37 +798,137 @@ class TestHelperRuleAllowlist(unittest.TestCase):
         This is not hypothetical: with firewalld stopped, `firewall-cmd` waits
         on D-Bus activation, and the GUI polls the rule list on a timer. Run
         straight from the coroutine, those calls wedged the event loop so
-        completely that even `ping` went unanswered — the firewall could be
-        switched off from the UI and then never switched back on.
+        completely that even `ping` went unanswered. A REAL child process here
+        (sleep), not a stand-in: what is being proved is that the child is
+        killed at the deadline, not merely abandoned.
         """
         helper = self.helper
-        original = helper.subprocess.run
-
-        def slow_run(args, **kwargs):
-            import time as _t
-            _t.sleep(1.5)
-            raise AssertionError("should have been abandoned before finishing")
+        pid_file = Path(tempfile.mkdtemp()) / "pid"
 
         async def scenario():
-            helper.subprocess.run = slow_run
-            try:
-                started = asyncio.get_running_loop().time()
-                slow = asyncio.create_task(
-                    helper._run(["sleep", "2"], timeout=0.3))
-                # While that is outstanding, an unrelated request must still be
-                # served promptly — that is the whole point.
-                pong = await asyncio.wait_for(
-                    helper._dispatch({"cmd": "ping", "id": 1}, None), timeout=1.0)
-                result = await slow
-                return pong, result, asyncio.get_running_loop().time() - started
-            finally:
-                helper.subprocess.run = original
+            started = asyncio.get_running_loop().time()
+            slow = asyncio.create_task(helper._run(
+                ["sh", "-c", f'echo $$ > "{pid_file}"; exec sleep 30'], timeout=0.5))
+            # Generous on purpose: the point is that ping is answered AT ALL
+            # while a command hangs, not how fast this machine is.
+            pong = await asyncio.wait_for(
+                helper._dispatch({"cmd": "ping", "id": 1}, None), timeout=5.0)
+            result = await slow
+            return pong, result, asyncio.get_running_loop().time() - started
 
         pong, result, elapsed = asyncio.run(scenario())
         self.assertTrue(pong["ok"])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("timed out", result.stderr)
-        self.assertLess(elapsed, 4.0, "the helper waited for the hung command")
+        self.assertLess(elapsed, 10.0,
+                        "the helper waited for the hung command to finish")
+        pid = int(pid_file.read_text())
+        self.assertFalse(Path(f"/proc/{pid}").exists(),
+                         "the timed-out child is still running")
+
+    def test_an_abandoned_command_dies_with_its_request(self):
+        """Stopping the helper cancels in-flight requests; their children must
+        die with them. With worker threads they could not be cancelled, and
+        `systemctl stop` waited out its timeout and SIGKILLed the helper."""
+        helper = self.helper
+        pid_file = Path(tempfile.mkdtemp()) / "pid"
+
+        async def scenario():
+            task = asyncio.create_task(helper._run(
+                ["sh", "-c", f'echo $$ > "{pid_file}"; exec sleep 30'], timeout=60.0))
+            for _ in range(100):                     # wait for the child to start
+                if pid_file.exists() and pid_file.read_text().strip():
+                    break
+                await asyncio.sleep(0.02)
+            started = asyncio.get_running_loop().time()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            return asyncio.get_running_loop().time() - started
+
+        elapsed = asyncio.run(scenario())
+        self.assertLess(elapsed, 2.0)
+        pid = int(pid_file.read_text())
+
+        def running() -> bool:
+            # A zombie (state Z) has exited; it only waits for its parent — this
+            # test's closed event loop — to collect it. The helper's loop keeps
+            # running and reaps it.
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text()
+            except FileNotFoundError:
+                return False
+            return stat[stat.rindex(")") + 2] != "Z"
+
+        for _ in range(50):
+            if not running():
+                break
+            time.sleep(0.02)
+        self.assertFalse(running(), "the cancelled request left its child running")
+
+    def test_sigterm_stops_the_helper_while_the_gui_is_connected(self):
+        """The GUI never disconnects, and since Python 3.12 the server's
+        shutdown waits for every connection to end on its own — so every
+        `systemctl stop/restart maze-guard` with a window open timed out and
+        ended in SIGKILL. The helper must hang up on its clients itself."""
+        import signal as _signal
+        import socket as _socket
+        helper = self.helper
+        # A short directory: AF_UNIX paths are limited to 108 bytes.
+        d = tempfile.mkdtemp(prefix="mg", dir="/tmp")
+        sock_path = os.path.join(d, "t.sock")
+        saved = (helper._SOCK_DIR, helper._sniff_thread, helper._peer_allowed)
+        helper._SOCK_DIR = d
+        helper._sniff_thread = lambda iface: None
+        helper._peer_allowed = lambda w: True
+
+        async def scenario():
+            server = asyncio.create_task(helper._serve(sock_path, "lo"))
+            for _ in range(100):
+                if os.path.exists(sock_path):
+                    break
+                await asyncio.sleep(0.02)
+            reader, writer = await asyncio.open_unix_connection(sock_path)
+            await asyncio.sleep(0.1)                 # connected and idle, like the GUI
+            started = asyncio.get_running_loop().time()
+            os.kill(os.getpid(), _signal.SIGTERM)    # handled by the helper's loop
+            await asyncio.wait_for(server, timeout=5.0)
+            elapsed = asyncio.get_running_loop().time() - started
+            writer.close()
+            return elapsed
+
+        try:
+            elapsed = asyncio.run(scenario())
+        finally:
+            helper._SOCK_DIR, helper._sniff_thread, helper._peer_allowed = saved
+            shutil.rmtree(d, ignore_errors=True)
+        self.assertLess(elapsed, 2.0)
+
+    def test_a_command_that_cannot_start_is_reported_not_raised(self):
+        r = asyncio.run(self.helper._run(["/nonexistent/maze-selftest-cmd"]))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertTrue(r.stderr)
+
+    def test_an_unreadable_firewall_state_is_not_cached_as_not_installed(self):
+        """A failed probe used to read as "firewalld is not installed" (the
+        GUI's "Unavailable") and that wrong answer was cached."""
+        helper = self.helper
+
+        async def failing(args, timeout=10.0):
+            return helper._Completed(stderr="timed out after 5.0s")
+
+        saved = (helper._run, helper._fw_unit_installed)
+        helper._run, helper._fw_unit_installed = failing, (lambda: True)
+        helper._fw_forget()
+        try:
+            resp = asyncio.run(helper._dispatch({"cmd": "fw_state", "id": 7}, None))
+            self.assertFalse(resp["ok"])
+            self.assertIn("could not read the firewalld state", resp["err"])
+            self.assertTrue(resp["data"]["installed"])
+            self.assertIsNone(helper._fw_cached("state"))
+        finally:
+            helper._run, helper._fw_unit_installed = saved
+            helper._fw_forget()
 
     def test_firewall_commands_are_skipped_when_firewalld_is_down(self):
         helper = self.helper
@@ -749,6 +1070,10 @@ class TestHelperRuleAllowlist(unittest.TestCase):
         self.assertIn("attacker", needs(
             ["firewall-cmd", "--permanent", "--remove-rich-rule",
              "rule family=ipv4 source address=10.0.0.9 drop"]))
+        # A MAC block is an attacker block too (it outlives a DHCP renewal).
+        self.assertIn("attacker", needs(
+            ["firewall-cmd", "--permanent", "--remove-rich-rule",
+             "rule source mac=aa:bb:cc:dd:ee:ff drop"]))
 
     def test_polkit_subject_is_pinned_against_pid_reuse(self):
         """A bare pid can be recycled between check and act; the subject must
@@ -802,3 +1127,26 @@ class TestHelperRuleAllowlist(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class ThreatLevelDisplayTests(unittest.TestCase):
+    """The header shows the worst level seen, not the most recent one.
+
+    Blocking an attacker (DANGEROUS) is now followed by the recon result
+    (SUSPICIOUS) a few seconds later; last-event-wins downgraded the header to
+    SUSPICIOUS while the firewall block was still in force.
+    """
+
+    def test_a_later_lesser_event_does_not_downgrade(self):
+        level = escalate(ThreatLevel.SAFE, ThreatLevel.DANGEROUS)
+        level = escalate(level, ThreatLevel.SUSPICIOUS)
+        self.assertEqual(level, ThreatLevel.DANGEROUS)
+
+    def test_escalation_still_works(self):
+        level = escalate(ThreatLevel.SAFE, ThreatLevel.SUSPICIOUS)
+        self.assertEqual(escalate(level, ThreatLevel.DANGEROUS),
+                         ThreatLevel.DANGEROUS)
+
+    def test_safe_never_overrides_anything(self):
+        self.assertEqual(escalate(ThreatLevel.SUSPICIOUS, ThreatLevel.SAFE),
+                         ThreatLevel.SUSPICIOUS)

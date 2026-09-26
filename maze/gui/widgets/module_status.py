@@ -5,6 +5,19 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from maze.core.verify import FAIL, INFO, NA, PASS, WARN, Verdict
+
+# Colour and one-word label per verdict. The label answers the question the
+# button asks — "is this in effect?" — rather than restating Active/Inactive,
+# which is the claim the test exists to check.
+_VERDICT_STYLE = {
+    PASS: ("#00e676", "verify_pass"),
+    FAIL: ("#ff3d00", "verify_fail"),
+    WARN: ("#ffab00", "verify_warn"),
+    INFO: ("#8a8a8a", "verify_info"),
+    NA:   ("#666666", "verify_na"),
+}
+
 
 # (engine_key, i18n_key, category_i18n_key)
 #
@@ -39,10 +52,11 @@ class _Row:
     """One module line: name, sub-caption, status word and toggle."""
 
     def __init__(self, name_lbl: QLabel, detail_lbl: QLabel,
-                 status_lbl: QLabel, btn: QPushButton):
+                 status_lbl: QLabel, test_btn: QPushButton, btn: QPushButton):
         self.name = name_lbl
         self.detail = detail_lbl
         self.status = status_lbl
+        self.test = test_btn
         self.btn = btn
 
 
@@ -54,10 +68,17 @@ class ModuleStatusWidget(QWidget):
         self._rows: dict[str, _Row] = {}
         self._fw_state = None
         self._busy: set[str] = set()
+        self._testing: set[str] = set()
+        # Last self-test result per module. Shown in place of the module's own
+        # description, because a fact checked against the system outranks a
+        # module's account of itself — and cleared the moment the toggle moves,
+        # since it then describes a state that no longer exists.
+        self._verdicts: dict[str, Verdict] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addWidget(self._make_toolbar())
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -95,10 +116,19 @@ class ModuleStatusWidget(QWidget):
 
             detail_lbl = QLabel("")
             detail_lbl.setStyleSheet("font-size: 11px; color: #777;")
+            # Verdicts are written as sentences, not status codes. Without
+            # wrapping, one of them widens the whole tab.
+            detail_lbl.setWordWrap(True)
 
             status_lbl = QLabel("")
             status_lbl.setFixedWidth(90)
             status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+            test_btn = QPushButton(self._state.t("verify_btn"))
+            test_btn.setFixedWidth(64)
+            test_btn.setFixedHeight(30)
+            test_btn.setToolTip(self._state.t("tip_verify"))
+            test_btn.clicked.connect(lambda _, k=key: self._test(k))
 
             btn = QPushButton("○")
             btn.setFixedWidth(44)
@@ -112,7 +142,8 @@ class ModuleStatusWidget(QWidget):
             elif key == "firewall":
                 btn.setToolTip(self._state.t("tip_fw_shield"))
 
-            self._rows[key] = _Row(name_lbl, detail_lbl, status_lbl, btn)
+            self._rows[key] = _Row(name_lbl, detail_lbl, status_lbl,
+                                   test_btn, btn)
 
             text_col = QVBoxLayout()
             text_col.setContentsMargins(0, 0, 0, 0)
@@ -127,6 +158,7 @@ class ModuleStatusWidget(QWidget):
             row_layout.addLayout(text_col)
             row_layout.addStretch()
             row_layout.addWidget(status_lbl)
+            row_layout.addWidget(test_btn)
             row_layout.addWidget(btn)
 
             self._inner.addWidget(row_widget)
@@ -146,6 +178,87 @@ class ModuleStatusWidget(QWidget):
         )
         self._inner.addWidget(lbl)
 
+    def _make_toolbar(self) -> QWidget:
+        bar = QWidget()
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(24, 12, 24, 4)
+        row.setSpacing(12)
+
+        self._toolbar_hint = QLabel(self._state.t("verify_hint"))
+        self._toolbar_hint.setWordWrap(True)
+        self._toolbar_hint.setStyleSheet("font-size: 11px; color: #777;")
+        row.addWidget(self._toolbar_hint, 1)
+
+        self._test_all_btn = QPushButton(self._state.t("verify_all_btn"))
+        self._test_all_btn.setFixedHeight(30)
+        self._test_all_btn.setToolTip(self._state.t("tip_verify_all"))
+        self._test_all_btn.clicked.connect(
+            lambda: asyncio.ensure_future(self._run_all_tests()))
+        row.addWidget(self._test_all_btn)
+        return bar
+
+    # ── self-tests ────────────────────────────────────────────────────────
+
+    def _test(self, key: str) -> None:
+        if key in self._testing:
+            return
+        asyncio.ensure_future(self._run_test(key))
+
+    async def _run_test(self, key: str) -> Verdict:
+        self._testing.add(key)
+        row = self._rows[key]
+        row.test.setEnabled(False)
+        row.detail.setText(self._state.t("verify_running"))
+        row.detail.setStyleSheet("font-size: 11px; color: #ffab00;")
+        row.detail.setVisible(True)
+        try:
+            verdict = await self._engine.verify_module(key)
+        except Exception as exc:
+            verdict = Verdict(FAIL, str(exc))
+        finally:
+            self._testing.discard(key)
+            row.test.setEnabled(True)
+        self._verdicts[key] = verdict
+        self._show_verdict(key, verdict)
+        self._paint()
+        return verdict
+
+    async def _run_all_tests(self) -> None:
+        self._test_all_btn.setEnabled(False)
+        self._show_info(self._state.t("verify_all_running"))
+        tally = {PASS: 0, INFO: 0, WARN: 0, FAIL: 0, NA: 0}
+        try:
+            # One at a time: several of these open sockets or query the helper,
+            # and running them together would produce a burst that looks rather
+            # like the activity the application is built to notice.
+            for key, _i18n, _cat in MODULES:
+                verdict = await self._run_test(key)
+                tally[verdict.status] = tally.get(verdict.status, 0) + 1
+        finally:
+            self._test_all_btn.setEnabled(True)
+        # INFO is deliberately not folded into "in effect". A module with
+        # nothing to enforce yet is not protecting anything, and a tally that
+        # says otherwise is the same overstatement the Test button exists to
+        # remove — just moved down one line.
+        summary = (self._state.t("verify_summary")
+                   .replace("{pass}", str(tally[PASS]))
+                   .replace("{info}", str(tally[INFO]))
+                   .replace("{warn}", str(tally[WARN] + tally[NA]))
+                   .replace("{fail}", str(tally[FAIL])))
+        if tally[FAIL]:
+            self._show_error(summary)
+        else:
+            self._show_info(summary)
+
+    def _show_verdict(self, key: str, verdict: Verdict) -> None:
+        text = f"{self._name_of(key)} — {verdict.summary}"
+        if verdict.evidence:
+            text += "\n" + "\n".join(f"    · {e}" for e in verdict.evidence)
+        if verdict.status == FAIL:
+            self._show_error(text)
+        else:
+            self._show_info(text)
+
     # ── toggling ──────────────────────────────────────────────────────────
 
     def _toggle(self, key: str) -> None:
@@ -159,12 +272,28 @@ class ModuleStatusWidget(QWidget):
             asyncio.ensure_future(self._toggle_module(key))
 
     async def _toggle_module(self, key: str) -> None:
+        # The previous verdict described the state we are about to leave.
+        self._verdicts.pop(key, None)
         self._busy.add(key)
+        self._set_pending(key)
         try:
             await self._engine.toggle_module(key)
         finally:
             self._busy.discard(key)
+        # A module that refuses to start used to leave the toggle flicking
+        # straight back to off with the reason buried in a log file. Say it.
+        if not self._engine.module_states().get(key, False):
+            reason = self._engine.module_error(key)
+            if reason:
+                self._show_error(f"{self._name_of(key)}: {reason}")
+            else:
+                self._show_info("")
+        else:
+            self._show_info("")
         self.refresh()
+
+    def _name_of(self, key: str) -> str:
+        return self._state.t(next(m[1] for m in MODULES if m[0] == key))
 
     async def _toggle_fw_backend(self) -> None:
         # max_age=0: never decide whether to stop the firewall, or what to warn
@@ -179,6 +308,7 @@ class ModuleStatusWidget(QWidget):
             if not self._confirm(self._state.t("fw_confirm_title"),
                                  self._state.t("fw_confirm_body")):
                 return
+        self._verdicts.pop("fw_backend", None)
         self._busy.add("fw_backend")
         self._set_pending("fw_backend")
         try:
@@ -199,6 +329,7 @@ class ModuleStatusWidget(QWidget):
             self._show_error(self._state.t("fw_msg_need_running"))
             self.refresh()
             return
+        self._verdicts.pop("firewall", None)
         self._busy.add("firewall")
         self._set_pending("firewall")
         try:
@@ -234,7 +365,7 @@ class ModuleStatusWidget(QWidget):
         s = self._state
 
         for key, row in self._rows.items():
-            if key in self._busy:
+            if key in self._busy or key in self._testing:
                 continue
             detail = ""
             if key == "fw_backend":
@@ -263,13 +394,39 @@ class ModuleStatusWidget(QWidget):
             else:
                 active = states.get(key, False)
                 status = s.t("status_active" if active else "status_inactive")
+                if active:
+                    # What a running module is actually doing. "Active" alone
+                    # is exactly the reassurance a module that has gone blind
+                    # — a rogue-AP watcher on a wired link, a blocker whose
+                    # rules never reached the firewall — must not be able to
+                    # give.
+                    detail = self._engine.module_detail(key)
+                else:
+                    reason = self._engine.module_error(key)
+                    if reason:
+                        status = s.t("status_unavailable")
+                        detail = reason
 
             row.status.setText(status)
             row.status.setStyleSheet(
                 f"color: {'#00e676' if active else '#555555'}; font-size: 12px;"
             )
-            row.detail.setText(detail)
-            row.detail.setVisible(bool(detail))
+
+            # A verdict outranks the module's own description of itself: it was
+            # checked against the system, and that is the whole point of it.
+            verdict = self._verdicts.get(key)
+            if verdict is not None:
+                colour, label_key = _VERDICT_STYLE.get(
+                    verdict.status, _VERDICT_STYLE[NA])
+                row.detail.setText(f"{s.t(label_key)} — {verdict.summary}")
+                row.detail.setStyleSheet(f"font-size: 11px; color: {colour};")
+                row.detail.setToolTip("\n".join(verdict.evidence))
+                row.detail.setVisible(True)
+            else:
+                row.detail.setText(detail)
+                row.detail.setStyleSheet("font-size: 11px; color: #777;")
+                row.detail.setToolTip("")
+                row.detail.setVisible(bool(detail))
             row.btn.setText("●" if active else "○")
             row.btn.setProperty("active", active)
             _polish(row.btn)
@@ -305,9 +462,14 @@ class ModuleStatusWidget(QWidget):
     # ── i18n ──────────────────────────────────────────────────────────────
 
     def retranslate(self, _lang: str = None) -> None:
+        self._toolbar_hint.setText(self._state.t("verify_hint"))
+        self._test_all_btn.setText(self._state.t("verify_all_btn"))
+        self._test_all_btn.setToolTip(self._state.t("tip_verify_all"))
         for key, row in self._rows.items():
             i18n_key = next(m[1] for m in MODULES if m[0] == key)
             row.name.setText(self._state.t(i18n_key))
+            row.test.setText(self._state.t("verify_btn"))
+            row.test.setToolTip(self._state.t("tip_verify"))
             if key == "fw_backend":
                 row.btn.setToolTip(self._state.t("tip_fw_backend"))
             elif key == "firewall":

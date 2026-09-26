@@ -13,6 +13,10 @@ import subprocess
 import sys
 import time
 
+# Child processes inherit this: the maze code they run never writes the
+# user's real ~/.config/maze/maze.log.
+os.environ.setdefault("MAZE_GUARD_LOG_FILE", "")
+
 TARGET_IP   = "192.168.0.26"    # this machine's Ethernet IP
 TARGET_MAC  = None              # auto-detected below
 IFACE       = "enp42s0"
