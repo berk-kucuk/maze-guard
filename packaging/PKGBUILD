@@ -12,7 +12,7 @@
 
 pkgname=maze-guard
 pkgver=2.19.0
-pkgrel=7
+pkgrel=8
 pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration"
 arch=('x86_64' 'aarch64')
 url="https://github.com/berk-kucuk/maze-guard"

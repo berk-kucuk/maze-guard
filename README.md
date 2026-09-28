@@ -114,7 +114,7 @@ catch everything teaches you to stop checking.
 └───────────────────────────┼──────────────────┘
               /run/maze/maze.sock (root:maze 0660)
 ┌───────────────────────────┼──────────────────┐
-│  Helper Daemon (root, systemd: maze.service) │
+│  Helper Daemon (root, maze-guard.service)    │
 │                           ▼                  │
 │   scapy (ARP/TCP/ICMP/DHCP) ───► push events│
 │   firewalld (firewall rules)                  │
@@ -130,7 +130,7 @@ Rich rules are matched **in full** against fixed patterns rather than by prefix,
 
 ## Requirements
 
-- **OS:** Linux (kernel 4.x+, any distribution)
+- **OS:** Arch Linux or an Arch-based distribution (installed as a pacman package)
 - **Python:** 3.11 or newer
 - **System tools:** `firewalld`, `iproute2`, `dbus`
 - **Optional:** `wireless-tools` (WiFi SSID/BSSID detection), `imagemagick` (icon resizing)
@@ -139,55 +139,68 @@ Rich rules are matched **in full** against fixed patterns rather than by prefix,
 
 ## Installation
 
-### Arch Linux (AUR)
+### From the Maze repository
+
+**On Maze Linux** the repository is already configured:
 
 ```bash
-# with paru
-paru -S maze
-
-# with yay
-yay -S maze
+sudo pacman -S maze-guard
 ```
 
-The AUR package installs Maze Guard to `/opt/maze-guard` and creates an isolated Python venv at `/opt/maze-guard/venv` — no system Python packages are modified.
+**On Arch Linux and Arch-based distributions**, add the repository once:
 
----
+1. Import and trust the Maze signing key:
 
-### Any Linux distribution (install script)
+   ```bash
+   curl -O https://mazerepo.berkkucukk.com.tr/packages/mazelinux.gpg
+   gpg --show-keys --with-fingerprint mazelinux.gpg
+   sudo pacman-key --add mazelinux.gpg
+   sudo pacman-key --lsign-key 7C4D515A6B930CB04794CEF6147C8159B3E2EE5F
+   ```
+
+   The fingerprint `gpg` prints must be `7C4D 515A 6B93 0CB0 4794  CEF6 147C 8159 B3E2 EE5F`.
+
+2. Add the repository to the end of `/etc/pacman.conf`:
+
+   ```ini
+   [mazelinux]
+   SigLevel = Required DatabaseOptional
+   Server = https://mazerepo.berkkucukk.com.tr/packages
+   ```
+
+3. Sync and install:
+
+   ```bash
+   sudo pacman -Syu maze-guard
+   ```
+
+Optionally install `mazelinux-keyring` as well; it keeps the signing key up to date through pacman.
+
+Remove with `sudo pacman -Rns maze-guard`.
+
+Then launch it from your application menu or run `maze-guard`.
+
+### Build from source
+
+The package is built from this working tree by `build-pkg.sh` and installed with pacman, exactly like the published one:
 
 ```bash
+sudo pacman -S --needed base-devel git
 git clone https://github.com/berk-kucuk/maze-guard.git
-cd maze
-
-# System-wide install to /opt/maze-guard  (requires root)
-sudo ./install.sh
-
-# Per-user install to ~/.local  (no root needed)
-./install.sh --user
+cd maze-guard
+sudo pacman -S --needed $(bash -c 'source packaging/PKGBUILD; echo "${depends[@]}" "${makedepends[@]}"')
+./build-pkg.sh --install
 ```
 
-The script detects your distribution and installs system dependencies automatically (Arch, Debian/Ubuntu, Fedora, RHEL, openSUSE and derivatives).
+Without `--install` the package is only built, into `dist-pkg/`.
 
-After install, launch from your application menu or run:
+`maze-python` (the shared Python runtime) comes from the Maze repository, so add the repository first (steps 1–2 above).
 
-```bash
-maze
-```
+### Development
 
-To uninstall:
+Run straight from a checkout in a virtual environment:
 
 ```bash
-sudo /opt/maze-guard/uninstall.sh
-```
-
----
-
-### From source (development)
-
-```bash
-git clone https://github.com/berk-kucuk/maze-guard.git
-cd maze
-
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -199,7 +212,7 @@ python main.py
 
 ## First Launch
 
-Maze Guard **never asks for a password**. A system install registers the privileged helper as a systemd service (`maze.service`) that starts at boot, and the GUI simply connects to it over `/run/maze/maze.sock`.
+Maze Guard **never asks for a password**. The package registers the privileged helper as a systemd service (`maze-guard.service`) that starts at boot, and the GUI simply connects to it over `/run/maze/maze.sock`.
 
 A `maze` group gates access to that socket, and your user is added to it during install. **Log out and back in once** (or run `newgrp maze`) so your desktop session picks up the new group membership — until then the GUI runs in limited (detection-only) mode.
 
@@ -282,7 +295,7 @@ In the **Events** tab, click **Export** to save the currently visible events (re
 
 ### Autostart
 
-The installer adds an autostart entry (`maze.desktop` with `Exec=maze --background`) so Maze Guard launches **hidden in the system tray** on every login — the detection engine starts in the background without opening a window. Click the tray icon to show the dashboard; closing the window minimizes it back to the tray. System installs write `/etc/xdg/autostart/maze.desktop`; user installs write `~/.config/autostart/maze.desktop`.
+The package adds an autostart entry (`maze-guard.desktop` with `Exec=maze-guard --background`) so Maze Guard launches **hidden in the system tray** on every login — the detection engine starts in the background without opening a window. Click the tray icon to show the dashboard; closing the window minimizes it back to the tray. It lives at `/etc/xdg/autostart/maze-guard.desktop`.
 
 ---
 
