@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "maze-guard"
-version = "2.19.0"
+version = "2.19.1"
 description = "Maze Guard — Public WiFi güvenlik aracı: MITM tespiti, firewall otomasyonu"
 requires-python = ">=3.11"
 dependencies = [

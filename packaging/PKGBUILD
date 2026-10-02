@@ -11,8 +11,8 @@
 #   source=("$pkgname-$pkgver.tar.gz::https://github.com/berk-kucuk/maze-guard/archive/refs/tags/v$pkgver.tar.gz")
 
 pkgname=maze-guard
-pkgver=2.19.0
-pkgrel=8
+pkgver=2.19.1
+pkgrel=1
 pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration"
 arch=('x86_64' 'aarch64')
 url="https://github.com/berk-kucuk/maze-guard"
@@ -190,21 +190,13 @@ X-GNOME-Autostart-enabled=true
 AUTOSTART
 
     # ── Icons ──────────────────────────────────────────────────────────────
-    if [[ -f MAZE.png ]]; then
-        for size in 16 32 48 64 128 256 512; do
-            install -dm755 "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps"
-            if command -v convert &>/dev/null; then
-                convert -resize "${size}x${size}" MAZE.png \
-                    "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-guard.png" \
-                    2>/dev/null \
-                    || install -m644 MAZE.png \
-                        "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-guard.png"
-            else
-                install -m644 MAZE.png \
-                    "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-guard.png"
-            fi
-        done
-    fi
+    # Pre-rendered by tools/make_logo.py (16-32 carry the heavier small mark).
+    for size in 16 22 24 32 48 64 128 256 512; do
+        install -Dm644 "maze/gui/logo/maze-guard-${size}.png" \
+            "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/maze-guard.png"
+    done
+    install -Dm644 maze/gui/logo/maze-guard.svg \
+        "$pkgdir/usr/share/icons/hicolor/scalable/apps/maze-guard.svg"
 
     # ── License ────────────────────────────────────────────────────────────
     install -dm755 "$pkgdir/usr/share/licenses/$pkgname"

@@ -108,9 +108,10 @@ do_uninstall() {
   done
 
   # Remove icons
-  for size in 16 32 48 64 128 256 512; do
+  for size in 16 22 24 32 48 64 128 256 512; do
     rm -f "$ICON_HICOLOR/${size}x${size}/apps/maze-guard.png"
   done
+  rm -f "$ICON_HICOLOR/scalable/apps/maze-guard.svg"
   command -v gtk-update-icon-cache &>/dev/null && \
     gtk-update-icon-cache -f -t "$ICON_HICOLOR" 2>/dev/null || true
   command -v update-desktop-database &>/dev/null && \
@@ -322,19 +323,17 @@ LAUNCHER_EOF
 # ── Icons ─────────────────────────────────────────────────────────────────────
 install_icons() {
   step "Installing icons"
-  [[ ! -f "$INSTALL_DIR/MAZE.png" ]] && { warn "Icon file not found — skipping"; return; }
+  local logo="$INSTALL_DIR/maze/gui/logo"
+  [[ ! -d "$logo" ]] && { warn "Icon files not found — skipping"; return; }
 
-  for size in 16 32 48 64 128 256 512; do
-    local dir="$ICON_HICOLOR/${size}x${size}/apps"
-    mkdir -p "$dir"
-    if command -v convert &>/dev/null; then
-      convert -resize "${size}x${size}" \
-        "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png" 2>/dev/null \
-        || cp "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png"
-    else
-      cp "$INSTALL_DIR/MAZE.png" "$dir/maze-guard.png"
-    fi
+  # Pre-rendered by tools/make_logo.py (16-32 carry the heavier small mark).
+  for size in 16 22 24 32 48 64 128 256 512; do
+    [[ -f "$logo/maze-guard-$size.png" ]] || continue
+    install -Dm644 "$logo/maze-guard-$size.png" \
+      "$ICON_HICOLOR/${size}x${size}/apps/maze-guard.png"
   done
+  [[ -f "$logo/maze-guard.svg" ]] && install -Dm644 "$logo/maze-guard.svg" \
+    "$ICON_HICOLOR/scalable/apps/maze-guard.svg"
 
   if $NEED_ROOT; then
     command -v gtk-update-icon-cache &>/dev/null && \
@@ -532,9 +531,10 @@ rm -f  "$LAUNCHER"
 rm -f  "$DESKTOP_DIR/maze-guard.desktop"
 rm -f  "$AUTOSTART_DIR/maze-guard.desktop"
 
-for size in 16 32 48 64 128 256 512; do
+for size in 16 22 24 32 48 64 128 256 512; do
   rm -f "$ICON_HICOLOR/\${size}x\${size}/apps/maze-guard.png"
 done
+rm -f "$ICON_HICOLOR/scalable/apps/maze-guard.svg"
 command -v gtk-update-icon-cache &>/dev/null && \
   gtk-update-icon-cache -f -t "$ICON_HICOLOR" 2>/dev/null || true
 command -v update-desktop-database &>/dev/null && \
