@@ -335,8 +335,31 @@ class TestIncidentStore(unittest.TestCase):
         self.assertEqual(att.severity, "medium")
         att = self.store.record(Event(
             type=EventType.ARP_SPOOF, level=ThreatLevel.DANGEROUS,
-            message="spoof", data={"ip": "10.0.0.99"}))
+            message="spoof", data={"ip": "10.0.0.1", "src": "10.0.0.99"}))
         self.assertEqual(att.severity, "high")
+
+    def test_an_impersonation_is_filed_under_the_impersonator(self):
+        """An ARP spoof's "ip" is the victim — usually the router. Filing it
+        there put the gateway on the Threats page as the attacker."""
+        self.assertIsNone(self.store.record(Event(
+            type=EventType.ARP_SPOOF, level=ThreatLevel.DANGEROUS,
+            message="spoof", data={"ip": "10.0.0.1", "new_mac": "ee:ee:ee:ee:ee:66"})))
+        self.assertIsNone(self.store.get("10.0.0.1"))
+        att = self.store.record(Event(
+            type=EventType.ARP_SPOOF, level=ThreatLevel.DANGEROUS,
+            message="spoof", data={"ip": "10.0.0.1", "src": "10.0.0.66",
+                                   "mac": "ee:ee:ee:ee:ee:66"}))
+        self.assertEqual((att.ip, att.mac), ("10.0.0.66", "ee:ee:ee:ee:ee:66"))
+        self.assertIsNone(self.store.get("10.0.0.1"))
+
+    def test_addresses_that_are_not_attackers_are_not_filed(self):
+        for kind, data in ((EventType.DNS_LEAK, {"ip": "8.8.8.8"}),
+                           (EventType.SSL_STRIP, {"ip": "93.184.216.34", "src": "93.184.216.34"}),
+                           (EventType.ANOMALY, {"mac": "ee:ee:ee:ee:ee:66",
+                                                "claimed_ips": ["10.0.0.1"],
+                                                "technique": "arp_poisoning"})):
+            self.assertIsNone(self.store.record(Event(
+                type=kind, level=ThreatLevel.DANGEROUS, message="x", data=data)), kind)
 
     def test_repeats_of_one_technique_count_for_less(self):
         first = self.store.record(self._scan_event()).score()
@@ -976,7 +999,7 @@ class TestHelperRuleAllowlist(unittest.TestCase):
         async def up():
             return True
 
-        async def verdict(writer, what):
+        async def verdict(writer, what, action=None):
             return (True, "") if granted else (False, "authorisation was declined")
 
         saved = (helper._run, helper._firewalld_active,

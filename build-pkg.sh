@@ -114,6 +114,10 @@ done
 [[ -f "$PKG_SRC/org.mazeguard.policy" ]] \
   && cp "$PKG_SRC/org.mazeguard.policy" "$STAGE/" \
   || die "Missing $PKG_SRC/org.mazeguard.policy"
+# The helper's systemd unit — one source for the package and install.sh.
+[[ -f "$PKG_SRC/maze-guard.service" ]] \
+  && cp "$PKG_SRC/maze-guard.service" "$STAGE/" \
+  || die "Missing $PKG_SRC/maze-guard.service"
 
 info "Creating source tarball"
 tar czf "$BUILD/maze-guard-${VER}.tar.gz" -C "$OUT/stage" "maze-guard-${VER}"

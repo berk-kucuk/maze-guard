@@ -9,6 +9,15 @@ from typing import Callable
 
 # Fixed socket published by the daemon (see maze/helper.py).
 _SOCK_PATH = "/run/maze/maze.sock"
+# Longest response line accepted. asyncio's default is 64 KB, and a proc_conns
+# answer on a busy desktop (every connection, with its command line) passes
+# that: the read loop died on the overrun and the helper dropped to
+# "disconnected" every time the connection map refreshed.
+_LINE_LIMIT = 16 * 1024 * 1024
+# The request vocabulary this GUI expects (maze/helper.py PROTOCOL). A daemon
+# that answers with less — or does not know "version" at all — predates fixes
+# this GUI relies on, and the user is told to restart or reinstall it.
+EXPECTED_PROTOCOL = 2
 
 
 class HelperClient:
@@ -21,12 +30,14 @@ class HelperClient:
         self._event_cbs: list[Callable] = []
         self._next_id = 1
         self._connected = False
+        self.protocol: int | None = None     # None until asked
 
     # ── connection ────────────────────────────────────────────────────────
 
     async def connect(self) -> bool:
         try:
-            self._reader, self._writer = await asyncio.open_unix_connection(self._sock)
+            self._reader, self._writer = await asyncio.open_unix_connection(
+                self._sock, limit=_LINE_LIMIT)
             self._connected = True
             asyncio.create_task(self._read_loop())
             return True
@@ -114,8 +125,27 @@ class HelperClient:
             pass
         finally:
             self._connected = False
+            # Nothing will answer these now; fail them instead of leaving each
+            # caller to sit out its own timeout (two minutes for fw_cmd).
+            pending, self._pending = self._pending, {}
+            for rid, fut in pending.items():
+                if not fut.done():
+                    fut.set_result({"id": rid, "ok": False,
+                                    "err": "helper connection lost"})
 
     # ── API ───────────────────────────────────────────────────────────────
+
+    async def version(self) -> int:
+        """The daemon's protocol number; 0 for a daemon too old to say."""
+        r = await self._send({"cmd": "version"})
+        data = r.get("data") if r.get("ok") else None
+        proto = data.get("protocol") if isinstance(data, dict) else 0
+        self.protocol = proto if isinstance(proto, int) else 0
+        return self.protocol
+
+    @property
+    def outdated(self) -> bool:
+        return self.protocol is not None and self.protocol < EXPECTED_PROTOCOL
 
     async def ping(self) -> bool:
         try:
@@ -217,10 +247,3 @@ class HelperClient:
     async def sysctl_set(self, key: str, value: str) -> bool:
         r = await self._send({"cmd": "sysctl_set", "key": key, "value": value})
         return bool(r.get("ok"))
-
-    async def maintain_connection(self) -> None:
-        """Background reconnect loop: re-connects if the helper socket drops."""
-        while True:
-            await asyncio.sleep(10)
-            if not self._connected:
-                await self.connect()

@@ -365,5 +365,79 @@ class ConfigMigrationTests(unittest.TestCase):
         self.assertFalse(cfg.first_run_done)
 
 
+    def _load(self, data):
+        import json
+        from maze.utils import config as config_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.json"
+            path.write_text(json.dumps(data))
+            with unittest.mock.patch.object(config_mod, "CONFIG_PATH", path):
+                return config_mod.load_config()
+
+    def test_auto_profile_switching_is_migrated_off_once(self):
+        cfg = self._load({"config_version": 2, "auto_profile_switch": True})
+        self.assertFalse(cfg.auto_profile_switch)
+        self.assertEqual(cfg.config_version, 3)
+
+    def test_auto_profile_switching_turned_back_on_sticks(self):
+        cfg = self._load({"config_version": 3, "auto_profile_switch": True})
+        self.assertTrue(cfg.auto_profile_switch)
+
+
+class WhitelistTests(EngineTestBase):
+    def test_a_whitelisted_network_covers_its_addresses(self):
+        from maze.utils.ipaddr import AddressSet
+        wl = AddressSet(["10.0.0.0/8", "192.168.1.7", "fd00::/8"])
+        self.assertIn("10.20.30.40", wl)
+        self.assertIn("192.168.1.7", wl)
+        self.assertIn("fd00::1", wl)
+        self.assertNotIn("192.168.1.8", wl)
+        self.assertNotIn("", wl)
+
+    def test_settings_changes_reach_running_detectors(self):
+        detector = self.engine._modules["port_scan"]
+        self.assertNotIn("10.1.2.3", detector._whitelist)
+        self.engine.set_whitelist(["10.0.0.0/8"])
+        self.assertIn("10.1.2.3", detector._whitelist)
+        self.assertIn("10.1.2.3", self.engine._modules["arp_watch"]._whitelist)
+
+
+class ProfileSerialisationTests(EngineTestBase):
+    def test_overlapping_profile_switches_do_not_interleave(self):
+        order: list[str] = []
+
+        async def fake_start(key):
+            order.append(f"start:{key}")
+            await asyncio.sleep(0)
+            self.engine._active.add(key)
+
+        async def fake_stop(key):
+            order.append(f"stop:{key}")
+            await asyncio.sleep(0)
+            self.engine._active.discard(key)
+
+        async def go():
+            with unittest.mock.patch.object(self.engine, "_start_module", fake_start), \
+                 unittest.mock.patch.object(self.engine, "_stop_module", fake_stop):
+                await asyncio.gather(
+                    self.engine._apply_plan(["a", "b"], False, "x", "one"),
+                    self.engine._apply_plan(["c"], False, "x", "two"))
+
+        run(go())
+        # The second plan only starts once the first has finished, and ends
+        # with exactly its own modules running.
+        self.assertEqual(order[:2], ["start:a", "start:b"])
+        self.assertEqual(self.engine._active, {"c"})
+
+
+class FirewallPortRuleTests(unittest.TestCase):
+    def test_a_port_block_can_be_removed_in_every_spelling(self):
+        from maze.protection.firewall import FirewallManager
+        rules = FirewallManager._port_rules(22, "tcp")
+        self.assertEqual(len(rules), 4)
+        self.assertTrue(any("family=ipv6" in r for r in rules))
+        self.assertTrue(any("family=ipv4" in r and "log" not in r for r in rules))
+
+
 if __name__ == "__main__":
     unittest.main()

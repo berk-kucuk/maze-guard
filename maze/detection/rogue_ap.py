@@ -293,12 +293,17 @@ class RogueAPDetector:
                 self._pending_bssid = None
                 self._pending_count = 0
                 continue
-            if self._known_ssid and ssid == self._known_ssid:
-                await self._check_bssid(ssid, bssid)
-            else:
-                # A different network: its own baseline, from what we already
-                # know of it plus the access point we joined through.
-                self._adopt(ssid, bssid)
+            try:
+                if self._known_ssid and ssid == self._known_ssid:
+                    await self._check_bssid(ssid, bssid)
+                else:
+                    # A different network: its own baseline, from what we
+                    # already know of it plus the access point we joined.
+                    self._adopt(ssid, bssid)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:     # e.g. the BSSID store not writable
+                log.warning(f"RogueAPDetector: check failed — {exc}")
 
     # ── baselines ────────────────────────────────────────────────────────
 
@@ -366,7 +371,12 @@ class RogueAPDetector:
         hearing about.
         """
         while True:
-            await self._check_redirects()
+            try:
+                await self._check_redirects()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:     # never let one bad read end the loop
+                log.debug(f"RogueAPDetector: redirect check failed — {exc}")
             await asyncio.sleep(_REDIRECT_POLL)
 
     async def _check_redirects(self) -> None:

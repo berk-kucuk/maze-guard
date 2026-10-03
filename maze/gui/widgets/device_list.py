@@ -17,12 +17,13 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem,
-    QHeaderView, QSplitter, QTextEdit, QMenu, QApplication, QLabel, QFrame,
-    QFileDialog, QMessageBox, QLineEdit, QInputDialog,
+    QSplitter, QTextEdit, QMenu, QApplication, QLabel, QFrame,
+    QFileDialog, QMessageBox, QLineEdit, QInputDialog, QPushButton,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
+from maze.gui.widgets.common import attach_empty_state, setup_table
 from maze.core.device_intel import (
     DEFAULT_TTL, DeviceIntelCache, describe_progress, export_markdown,
     format_intel, summarize_intel,
@@ -97,47 +98,92 @@ class DeviceListWidget(QWidget):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 16, 24, 20)
+        layout.setSpacing(12)
         layout.addLayout(self._build_toolbar())
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setHandleWidth(6)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(12)
         splitter.addWidget(self._build_table())
         splitter.addWidget(self._build_detail())
-        splitter.setSizes([400, 300])
-        layout.addWidget(splitter)
+        splitter.setStretchFactor(0, 5)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([780, 320])
+        layout.addWidget(splitter, 1)
 
     def _build_toolbar(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setSpacing(8)
 
         self._search = QLineEdit()
-        self._search.setFixedHeight(28)
         self._search.setClearButtonEnabled(True)
         self._search.textChanged.connect(self._on_filter)
         row.addWidget(self._search, 1)
 
         self._summary = QLabel("")
-        self._summary.setStyleSheet("font-size: 12px; color: #888;")
+        self._summary.setObjectName("muted")
         row.addWidget(self._summary)
+
+        # The actions used to live only in a right-click menu nobody finds.
+        self._btn_scan = QPushButton()
+        self._btn_scan.setObjectName("primary")
+        self._btn_scan.clicked.connect(
+            lambda: self._gather("standard", force=self._selected_has_intel()))
+        self._btn_trust = QPushButton()
+        self._btn_trust.clicked.connect(self._toggle_trust_selected)
+        self._btn_label = QPushButton()
+        self._btn_label.clicked.connect(self._label_selected)
+        self._btn_scan_all = QPushButton()
+        self._btn_scan_all.clicked.connect(lambda: self._gather_all("quick"))
+        for b in (self._btn_scan, self._btn_trust, self._btn_label, self._btn_scan_all):
+            row.addWidget(b)
         return row
+
+    def _selected_has_intel(self) -> bool:
+        ip = self._selected_ip
+        if not ip:
+            return False
+        return self._cache.get(ip, self._devices.get(ip, {}).get("mac", "")) is not None
+
+    def _toggle_trust_selected(self) -> None:
+        ip = self._selected_ip
+        rec = self._record(ip) if ip else None
+        if rec is None or self._inventory is None:
+            return
+        mac = self._devices.get(ip, {}).get("mac", "")
+        self._inventory.set_trusted(mac, self._cache.network_id, not rec.trusted)
+        self._refresh_view()
+
+    def _label_selected(self) -> None:
+        ip = self._selected_ip
+        if not ip:
+            return
+        mac = self._devices.get(ip, {}).get("mac", "")
+        self._edit_label(ip, mac, self._record(ip))
+
+    def _update_buttons(self) -> None:
+        s = self._state
+        ip = self._selected_ip
+        rec = self._record(ip) if ip else None
+        scanning = bool(ip) and self._is_scanning(ip)
+        self._btn_scan.setEnabled(bool(ip) and not scanning)
+        self._btn_scan.setText(s.t("dev_btn_rescan") if self._selected_has_intel()
+                               else s.t("dev_btn_scan"))
+        self._btn_trust.setEnabled(rec is not None)
+        self._btn_trust.setText(s.t("dev_mark_unknown") if (rec and rec.trusted)
+                                else s.t("dev_mark_known"))
+        self._btn_label.setEnabled(rec is not None)
+        self._btn_scan_all.setEnabled(bool(self._devices))
 
     def _build_table(self) -> QTableWidget:
         self._table = QTableWidget(0, len(_COLUMNS))
-        self._table.verticalHeader().setVisible(False)
-        self._table.setAlternatingRowColors(True)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        setup_table(self._table, stretch=_COL_INFO,
+                    fit=(_COL_IP, _COL_MAC, _COL_NAME, _COL_KIND, _COL_KNOWN,
+                         _COL_SEEN))
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._empty = attach_empty_state(self._table, "")
 
         header = self._table.horizontalHeader()
-        header.setStretchLastSection(False)
-        for col, width in ((_COL_IP, 125), (_COL_MAC, 150), (_COL_KIND, 140),
-                           (_COL_KNOWN, 80), (_COL_INFO, 160), (_COL_SEEN, 90)):
-            self._table.setColumnWidth(col, width)
-            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(_COL_NAME, QHeaderView.ResizeMode.Stretch)
         header.setSectionsClickable(True)
         header.sectionClicked.connect(self._on_sort)
 
@@ -160,7 +206,7 @@ class DeviceListWidget(QWidget):
 
         self._detail = QTextEdit()
         self._detail.setReadOnly(True)
-        self._detail.setStyleSheet("font-family: monospace; font-size: 12px;")
+        self._detail.setStyleSheet("QTextEdit { border: none; background: transparent; }")
         layout.addWidget(self._detail)
         return frame
 
@@ -239,6 +285,8 @@ class DeviceListWidget(QWidget):
             for row, ip in enumerate(ips):
                 self._fill_row(row, ip)
         self._update_summary()
+        self._update_buttons()
+        self._empty.sync()
         self._show_detail(self._selected_ip)
 
     def _update_summary(self) -> None:
@@ -322,6 +370,7 @@ class DeviceListWidget(QWidget):
     def _on_select(self) -> None:
         rows = self._table.selectionModel().selectedRows()
         self._selected_ip = self._row_ip(rows[0].row()) if rows else None
+        self._update_buttons()
         self._show_detail(self._selected_ip)
 
     def _show_detail(self, ip: str | None) -> None:
@@ -517,6 +566,10 @@ class DeviceListWidget(QWidget):
         self._table.setHorizontalHeaderLabels([s.t(k) for k in _COLUMNS])
         self._detail_title.setText(s.t("dev_detail_title"))
         self._search.setPlaceholderText(s.t("dev_search"))
+        self._btn_label.setText(s.t("dev_set_label"))
+        self._btn_scan_all.setText(s.t("dev_btn_scan_all"))
+        self._btn_scan_all.setToolTip(s.t("dev_profile_quick_hint"))
+        self._empty.label.setText(s.t("dev_empty"))
         self._refresh_view()
 
 

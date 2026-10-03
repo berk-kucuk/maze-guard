@@ -1,74 +1,80 @@
 """Dialog to create or edit a custom security profile."""
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QCheckBox, QPushButton, QFrame,
+    QCheckBox, QDialog, QDialogButtonBox, QFrame, QLabel, QLineEdit, QVBoxLayout,
 )
-from PyQt6.QtCore import Qt
+
 from maze.utils.config import CustomProfileConfig
+
+# Feature flags in the order they are offered; labels are "pf_<flag>".
+_FEATURES = ("port_scan_detect", "process_monitor", "doh_enabled",
+             "block_incoming", "hide_hostname", "fingerprint_protect",
+             "block_services")
 
 
 class ProfileDialog(QDialog):
-    """Returns a CustomProfileConfig via .result after exec()."""
+    """Sets ``result_profile`` to a CustomProfileConfig when accepted."""
 
-    _FEATURES = [
-        ("port_scan_detect",   "Port scan detection"),
-        ("process_monitor",    "Unknown process monitoring"),
-        ("hide_hostname",      "Hide hostname (disable mDNS)"),
-        ("fingerprint_protect","TCP fingerprint protection"),
-        ("block_incoming",     "Block unsolicited incoming connections"),
-        ("block_services",     "Block mDNS/NetBIOS service leaks"),
-        ("doh_enabled",        "DNS-over-HTTPS (leak prevention)"),
-    ]
-
-    def __init__(self, parent=None, existing: CustomProfileConfig = None):
+    def __init__(self, state, parent=None, existing: CustomProfileConfig = None,
+                 taken: set | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Custom Profile" if not existing else f"Edit — {existing.name}")
-        self.setFixedWidth(380)
+        s = state.t
+        self._s = s
+        self._taken = {n.lower() for n in (taken or set())}
+        self.setWindowTitle(s("pf_title_edit") if existing else s("pf_title_new"))
+        self.setMinimumWidth(420)
         self.result_profile: CustomProfileConfig | None = None
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(24, 20, 24, 20)
-        root.setSpacing(14)
+        root.setContentsMargins(24, 20, 24, 18)
+        root.setSpacing(12)
 
-        # Name
-        root.addWidget(QLabel("Profile name:"))
+        root.addWidget(QLabel(s("pf_name")))
         self._name = QLineEdit(existing.name if existing else "")
-        self._name.setPlaceholderText("e.g. Office, Coffee Shop")
+        self._name.setPlaceholderText(s("pf_name_placeholder"))
         root.addWidget(self._name)
+        self._error = QLabel("")
+        self._error.setStyleSheet("color: #ff4d2e;")
+        self._error.setVisible(False)
+        root.addWidget(self._error)
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         root.addWidget(sep)
 
-        # Feature checkboxes
+        note = QLabel(s("pf_note"))
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        root.addWidget(note)
+
         self._checks: dict[str, QCheckBox] = {}
-        for key, label in self._FEATURES:
-            cb = QCheckBox(label)
+        for key in _FEATURES:
+            cb = QCheckBox(s(f"pf_{key}"))
             default = getattr(existing, key, key in ("port_scan_detect", "process_monitor"))
             cb.setChecked(bool(default))
             self._checks[key] = cb
             root.addWidget(cb)
 
-        # Buttons
-        btn_row = QHBoxLayout()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        btn_row.addWidget(cancel)
-        btn_row.addStretch()
-        save = QPushButton("Save Profile")
-        save.setDefault(True)
-        save.clicked.connect(self._save)
-        btn_row.addWidget(save)
-        root.addLayout(btn_row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
+                                   | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText(s("pf_save"))
+        buttons.button(QDialogButtonBox.StandardButton.Save).setObjectName("primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(s("pf_cancel"))
+        buttons.accepted.connect(self._save)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _fail(self, text: str) -> None:
+        self._error.setText(text)
+        self._error.setVisible(True)
 
     def _save(self) -> None:
         name = self._name.text().strip()
         if not name:
-            self._name.setPlaceholderText("Name is required!")
+            self._fail(self._s("pf_name_required"))
+            return
+        if name.lower() in self._taken:
+            self._fail(self._s("pf_name_taken"))
             return
         self.result_profile = CustomProfileConfig(
-            name=name,
-            **{key: self._checks[key].isChecked() for key, _ in self._FEATURES}
-        )
+            name=name, **{key: cb.isChecked() for key, cb in self._checks.items()})
         self.accept()

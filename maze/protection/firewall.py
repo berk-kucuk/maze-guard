@@ -1,4 +1,5 @@
 import re
+import time
 from dataclasses import dataclass, field
 
 from maze.utils.logger import log
@@ -49,6 +50,7 @@ class FirewallManager:
         self._zone: str = ""
         self._state = FirewallState()
         self._last_error: str = ""
+        self.changed_at = 0.0
 
     async def start(self, bus, helper=None) -> None:
         self._helper = helper
@@ -68,6 +70,9 @@ class FirewallManager:
             self._last_error = "privileged helper not connected"
             return False
         ok = await self._helper.fw_cmd(["firewall-cmd"] + args)
+        # Any command may have changed something (even a failed batch can
+        # be partly applied); cached readings older than this are stale.
+        self.changed_at = time.monotonic()
         if not ok:
             self._last_error = f"firewall-cmd {' '.join(args)} failed"
         return ok
@@ -93,9 +98,18 @@ class FirewallManager:
                 f'{_LOG_CLAUSE if with_log else ""}drop')
 
     @staticmethod
-    def _port_rule(port: int, proto: str, with_log: bool = True) -> str:
-        return (f'rule family=ipv4 port port={port} protocol={proto} '
+    def _port_rule(port: int, proto: str, with_log: bool = True,
+                   family: str = "ipv4") -> str:
+        return (f'rule family={family} port port={port} protocol={proto} '
                 f'{_LOG_CLAUSE if with_log else ""}drop')
+
+    @classmethod
+    def _port_rules(cls, port: int, proto: str) -> list[str]:
+        """Every spelling a port block may have been written in: both
+        families (a v4-only rule left the port open over IPv6) and with or
+        without the log clause (rules from before logging)."""
+        return [cls._port_rule(port, proto, with_log, family)
+                for family in ("ipv4", "ipv6") for with_log in (True, False)]
 
     @property
     def last_error(self) -> str:
@@ -210,6 +224,7 @@ class FirewallManager:
             self._last_error = "privileged helper not connected"
             return False
         ok, out = await self._helper.fw_service("start")
+        self.changed_at = time.monotonic()
         if not ok:
             self._last_error = out or "systemctl start firewalld failed"
             log.warning(f"firewall start failed: {self._last_error}")
@@ -226,6 +241,7 @@ class FirewallManager:
             self._last_error = "privileged helper not connected"
             return False
         ok, out = await self._helper.fw_service("stop")
+        self.changed_at = time.monotonic()
         if not ok:
             self._last_error = out or "systemctl stop firewalld failed"
             log.warning(f"firewall stop failed: {self._last_error}")
@@ -255,8 +271,7 @@ class FirewallManager:
                                     "--remove-rich-rule", rule])
         for proto_key, proto in [("ports_tcp", "tcp"), ("ports_udp", "udp")]:
             for port in rules.get(proto_key, []):
-                for rule in (self._port_rule(port, proto),
-                             self._port_rule(port, proto, with_log=False)):
+                for rule in self._port_rules(port, proto):
                     await self._fw_cmd(["--permanent", "--zone", self._zone,
                                         "--remove-rich-rule", rule])
         await self._fw_cmd(["--reload"])
@@ -322,18 +337,20 @@ class FirewallManager:
         ok = await self._fw_cmd(["--permanent", "--zone", self._zone,
                                  "--add-rich-rule", self._port_rule(port, proto)])
         if ok:
+            # Best effort: the v4 rule is the one the UI reports on.
+            await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                "--add-rich-rule",
+                                self._port_rule(port, proto, family="ipv6")])
             await self._fw_cmd(["--reload"])
         return ok
 
     async def unblock_port(self, port: int, proto: str = "tcp") -> bool:
         if not await self.ensure_init():
             return False
-        ok = await self._fw_cmd(["--permanent", "--zone", self._zone,
-                                 "--remove-rich-rule",
-                                 self._port_rule(port, proto)])
-        ok |= await self._fw_cmd(["--permanent", "--zone", self._zone,
-                                  "--remove-rich-rule",
-                                  self._port_rule(port, proto, with_log=False)])
+        ok = False
+        for rule in self._port_rules(port, proto):
+            ok |= await self._fw_cmd(["--permanent", "--zone", self._zone,
+                                      "--remove-rich-rule", rule])
         if ok:
             await self._fw_cmd(["--reload"])
         return ok
@@ -378,4 +395,4 @@ class FirewallManager:
     async def list_rules(self) -> dict:
         if self._has_helper():
             return await self._helper.fw_list()
-        return {"ips": [], "ports_tcp": [], "ports_udp": []}
+        return {"ips": [], "ports_tcp": [], "ports_udp": [], "macs": []}

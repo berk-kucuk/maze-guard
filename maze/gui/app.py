@@ -60,6 +60,18 @@ def _resolve_startup_profile(cfg) -> Profile:
         return Profile.HOME
 
 
+def _resolve_custom_profile(cfg):
+    """The persisted custom profile ("custom:<name>"), or None."""
+    value = str(getattr(cfg, "profile", "") or "")
+    if not value.startswith("custom:"):
+        return None
+    name = value.split(":", 1)[1]
+    for p in getattr(cfg, "custom_profiles", []):
+        if getattr(p, "name", None) == name:
+            return p
+    return None
+
+
 def _ask_first_run(cfg, state, parent) -> None:
     """Ask the four questions a fresh install cannot answer for itself.
 
@@ -153,6 +165,13 @@ def run() -> None:
         # Connect to the privileged helper daemon. No password prompt: if the
         # daemon is running the GUI gets full functionality, otherwise it runs
         # in limited (detection-only) mode.
+        # The first-run answers (the interface above all) must be in the
+        # config before the engine reads it: asked after, the detectors kept
+        # watching the old interface for the whole session while the network
+        # identity followed the new one.
+        if not start_hidden:
+            _ask_first_run(cfg, state, None)
+
         helper = await connect_helper(cfg.interface)
 
         engine = MazeEngine(cfg, helper=helper)
@@ -172,12 +191,15 @@ def run() -> None:
         # Autostart / background launch: stay in the tray, don't pop the window.
         if not start_hidden:
             window.show()
-            _ask_first_run(cfg, state, window)
         await engine.start()
 
         # Apply the startup profile so core protections run out of the box
         # rather than everything starting disabled (MANUAL).
-        engine.profiles.set(_resolve_startup_profile(cfg))
+        custom = _resolve_custom_profile(cfg)
+        if custom is not None:
+            await engine.apply_custom_profile(custom)
+        else:
+            engine.profiles.set(_resolve_startup_profile(cfg))
 
     with loop:
         loop.run_until_complete(_boot())

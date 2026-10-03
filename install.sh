@@ -457,35 +457,10 @@ setup_daemon() {
   fi
 
   # 3. systemd unit
-  cat > "$SERVICE_FILE" << SERVICE_EOF
-[Unit]
-Description=Maze Guard privileged helper
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=$VENV_PY_ABS $HELPER_ABS
-Restart=on-failure
-RestartSec=2
-# NO RuntimeDirectory=maze: /run/maze is shared with maze-tools' maze-guardd
-# (guard.sock) and Maze Sentinel. RuntimeDirectory would make systemd delete
-# the whole directory whenever this unit stops, destroying their files. The
-# helper creates and permissions the directory itself in _ensure_sock_dir().
-# Hardening. Deliberately conservative: firewalld needs to write /etc/firewalld
-# (so ProtectSystem stays at 'true', not 'strict'), the helper writes sysctl and
-# uses AF_PACKET for sniffing, so kernel-tunable/address-family locks are omitted.
-ProtectHome=true
-ProtectControlGroups=true
-ProtectKernelLogs=true
-ProtectSystem=true
-ProtectHostname=true
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-LockPersonality=true
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_EOF
+  # One unit definition, shared with the package: packaging/maze-guard.service.
+  local UNIT_SRC="$SRC_DIR/packaging/maze-guard.service"
+  [[ -f "$UNIT_SRC" ]] || fatal "packaging/maze-guard.service not found"
+  sed -e "s|@PYTHON@|$VENV_PY_ABS|" -e "s|@HELPER@|$HELPER_ABS|" "$UNIT_SRC" > "$SERVICE_FILE"
   ok "Service unit: $SERVICE_FILE"
 
   # 4. enable + start

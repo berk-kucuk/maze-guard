@@ -24,6 +24,7 @@ from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.core.verify import (FAIL, PASS, Verdict, WARN,
                               capture_feed, merge)
 from maze.utils.logger import log
+from maze.utils.ipaddr import AddressSet
 from maze.utils.network_info import link_epoch
 
 # Discovery windows. Deliberately short: a sweep is defined by doing many things
@@ -82,7 +83,7 @@ class AnomalyDetector:
 
     def __init__(self, interface: str, whitelist: list[str] | None = None):
         self.interface = interface
-        self._whitelist = set(whitelist or [])
+        self._whitelist = AddressSet.of(whitelist)
         self._bus: EventBus | None = None
         self._helper = None
         self._gw_ip: str = ""
@@ -221,8 +222,13 @@ class AnomalyDetector:
     async def _gateway_loop(self) -> None:
         while True:
             await asyncio.sleep(60)
-            await self._check_epoch()
-            await self._refresh_gateway()
+            try:
+                await self._check_epoch()
+                await self._refresh_gateway()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:     # never let one bad read end the loop
+                log.debug(f"AnomalyDetector: gateway check failed — {exc}")
 
     async def _refresh_gateway(self) -> None:
         try:
@@ -276,8 +282,9 @@ class AnomalyDetector:
                     message=(f"One MAC ({mac}) is answering ARP for "
                              f"{len(claims)} different addresses — consistent "
                              f"with ARP cache poisoning"),
-                    data={"mac": mac, "ip": src,
-                          "claimed_ips": sorted(claims)[:20],
+                    # No "ip": every claimed address is a victim, not the
+                    # attacker — whose own address this packet does not say.
+                    data={"mac": mac, "claimed_ips": sorted(claims)[:20],
                           "technique": "arp_poisoning"},
                 ))
             return

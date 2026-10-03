@@ -7,6 +7,7 @@ from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.core.verify import (FAIL, PASS, Verdict, WARN,
                               capture_feed, merge)
 from maze.utils.logger import log
+from maze.utils.ipaddr import AddressSet
 
 _WINDOW            = 300   # activity older than this stops counting (seconds)
 _PRUNE_INTERVAL    = 30    # how often stale records are swept
@@ -100,7 +101,7 @@ class PortScanDetector:
                  whitelist: list[str] | None = None):
         self.interface = interface
         self.threshold = max(3, threshold)
-        self._whitelist  = set(whitelist or [])
+        self._whitelist = AddressSet.of(whitelist)
         self._own_ips: set[str] = set()
         self._records: dict[str, ScanRecord] = {}
         self._blocked: set[str] = set()

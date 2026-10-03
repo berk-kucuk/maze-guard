@@ -8,6 +8,7 @@ from maze.core.inventory import DeviceInventory
 from maze.network.identity import NetworkIdentity
 from maze.core.profile import Profile, ProfileManager, PROFILES
 from maze.core.verify import FAIL, INFO, NA, PASS, Verdict, WARN
+from maze.utils.ipaddr import AddressSet
 from maze.utils.logger import log
 
 # Event types that mean "this source is actively attacking us right now", as
@@ -48,6 +49,15 @@ class MazeEngine:
         self._recon_at: dict[str, float] = {}
         self._block_log_at: datetime | None = None
         self._fw_state_at = 0.0
+        # One whitelist, shared by reference with every detector, so an entry
+        # added in Settings applies at once instead of after a restart.
+        self.whitelist = AddressSet(getattr(cfg, "whitelist_ips", []))
+        # Profile applications stop every module and start a new set, awaiting
+        # in between. Two of them in flight at once (a quick double switch, or
+        # the startup profile racing a network-triggered one) interleaved and
+        # left a mix of both profiles' modules running. They run one at a time.
+        self._plan_lock = asyncio.Lock()
+        self._last_plan: tuple | None = None
         self._init_modules()
         self.profiles.on_change(self._on_profile_change)
         self.identity.on_change(self._on_network_change)
@@ -89,7 +99,7 @@ class MazeEngine:
         from maze.protection.process_map import ProcessNetworkMonitor
         from maze.protection.dns_leak import DNSLeakPreventer
 
-        wl = list(getattr(self.cfg, "whitelist_ips", []))
+        wl = self.whitelist
         self._modules = {
             "arp_watch":       ARPWatcher(self.cfg.interface, whitelist=wl),
             "anomaly":         AnomalyDetector(self.cfg.interface, whitelist=wl),
@@ -113,6 +123,10 @@ class MazeEngine:
             "dns_leak":        DNSLeakPreventer(),
         }
 
+    def set_whitelist(self, entries) -> None:
+        """Replace the whitelist every detector consults, in place."""
+        self.whitelist.replace(entries)
+
     # ------------------------------------------------------------------
     # Convenience accessors
     # ------------------------------------------------------------------
@@ -135,8 +149,10 @@ class MazeEngine:
         self.bus.subscribe(EventType.DEVICE_FOUND, self._on_device_found)
         self.identity.start()
         await self.identity.refresh()
-        if self.helper:
-            asyncio.create_task(self.helper.maintain_connection())
+        if self.helper is not None:
+            if self.helper.is_connected():
+                await self._check_helper_version()
+            asyncio.create_task(self._helper_loop())
         asyncio.create_task(self._ssl_monitor_loop())
         asyncio.create_task(self._sync_firewall_state())
         asyncio.create_task(self._block_evidence_loop())
@@ -145,6 +161,41 @@ class MazeEngine:
             level=ThreatLevel.SAFE,
             message="Maze Guard engine started",
         ))
+
+    async def _helper_loop(self) -> None:
+        """Keep the helper connected, and move the modules onto it when it
+        (re)appears.
+
+        Capture-based detectors pick helper or direct capture once, at start.
+        Started while the daemon was down, they stayed on the direct path —
+        which needs root and so saw nothing — after the helper came up, so the
+        running profile is re-applied on every reconnect.
+        """
+        was_connected = self.helper.is_connected()
+        while self._running:
+            await asyncio.sleep(10)
+            if not self.helper.is_connected():
+                await self.helper.connect()
+            connected = self.helper.is_connected()
+            if connected and not was_connected:
+                await self._check_helper_version()
+            if connected and not was_connected and self._last_plan:
+                log.info("privileged helper connected — re-applying the profile")
+                try:
+                    await self._apply_plan(*self._last_plan)
+                except Exception as exc:
+                    log.warning(f"re-applying the profile failed: {exc}")
+            was_connected = connected
+
+    async def _check_helper_version(self) -> None:
+        try:
+            await self.helper.version()
+        except Exception as exc:
+            log.debug(f"helper version check failed: {exc}")
+            return
+        if getattr(self.helper, "outdated", False):
+            log.warning("the privileged helper is older than this interface — "
+                        "restart it: sudo systemctl restart maze-guard.service")
 
     async def _sync_firewall_state(self) -> None:
         """Best-effort: make the incoming-block button reflect the firewall's
@@ -304,18 +355,21 @@ class MazeEngine:
 
     async def _apply_plan(self, to_start: list[str], block_incoming: bool,
                           label: str, profile_value: str) -> None:
-        # Stop everything currently active, then start the profile's set.
-        # Stopping stealth modules restores their side effects (avahi restarts,
-        # sysctl restored, blocked ports removed), giving clean transitions.
-        await asyncio.gather(
-            *[self._stop_module(k) for k in list(self._active)],
-            return_exceptions=True,
-        )
-        for key in to_start:
-            await self._start_module(key)
-        await self._set_incoming_block(block_incoming)
+        self._last_plan = (to_start, block_incoming, label, profile_value)
+        async with self._plan_lock:
+            # Stop everything currently active, then start the profile's set.
+            # Stopping stealth modules restores their side effects (avahi
+            # restarts, sysctl restored, blocked ports removed), giving clean
+            # transitions.
+            await asyncio.gather(
+                *[self._stop_module(k) for k in list(self._active)],
+                return_exceptions=True,
+            )
+            for key in to_start:
+                await self._start_module(key)
+            await self._set_incoming_block(block_incoming)
+            started = sorted(self._active)
 
-        started = sorted(self._active)
         await self.bus.emit(Event(
             type=EventType.PROFILE_CHANGED,
             level=ThreatLevel.SAFE,
@@ -337,10 +391,13 @@ class MazeEngine:
     # ------------------------------------------------------------------
 
     async def toggle_module(self, key: str) -> None:
-        if key in self._active:
-            await self._stop_module(key)
-        else:
-            await self._start_module(key)
+        # Under the plan lock: a toggle landing mid-profile-switch was undone
+        # (or duplicated) by the switch's own stop-all/start-set pass.
+        async with self._plan_lock:
+            if key in self._active:
+                await self._stop_module(key)
+            else:
+                await self._start_module(key)
         await self.bus.emit(Event(
             type=EventType.MODULE_TOGGLED,
             level=ThreatLevel.SAFE,
@@ -420,6 +477,12 @@ class MazeEngine:
         check = getattr(mod, "verify", None)
         if check is None:
             return Verdict(NA, "this module has no self-test yet")
+        # A module that was never started has no helper reference, and its
+        # self-test then claimed "the privileged helper is not connected"
+        # although it was. The test reads system state either way; lend it
+        # the helper so the answer is about the system, not about the toggle.
+        if getattr(mod, "_helper", False) is None and self.helper is not None:
+            mod._helper = self.helper
         try:
             verdict = await check()
         except Exception as exc:
@@ -540,7 +603,7 @@ class MazeEngine:
         firewalling it — a self-inflicted DoS. Blocks (subprocess) — call off
         the event loop.
         """
-        ips: set[str] = set(getattr(self.cfg, "whitelist_ips", []))
+        ips: set[str] = set()
         try:
             from maze.utils.network_info import get_interface_info
             info = get_interface_info(self.cfg.interface)
@@ -606,7 +669,7 @@ class MazeEngine:
 
         # Never touch critical infrastructure — the source may be spoofed.
         infra = await asyncio.to_thread(self._infra_ips)
-        if ip in infra:
+        if ip in infra or ip in self.whitelist:
             log.info(f"recon/auto-block skipped for infrastructure IP {ip}")
             return
         # Only actively probe on-link (private) hosts. A real attacker on public
@@ -757,6 +820,10 @@ class MazeEngine:
         record = self.inventory.by_ip(ip, self.identity.network_id)
         return record.mac if record else ""
 
+    async def unblock_mac(self, mac: str) -> bool:
+        fw = self._fw()
+        return await fw.unblock_mac(mac) if fw else False
+
     async def _block_mac_for(self, ip: str) -> bool:
         fw = self._fw()
         mac = self.mac_for(ip)
@@ -779,7 +846,8 @@ class MazeEngine:
 
     async def list_fw_rules(self) -> dict:
         fw = self._fw()
-        return await fw.list_rules() if fw else {"ips": [], "ports_tcp": [], "ports_udp": []}
+        return await fw.list_rules() if fw else {"ips": [], "ports_tcp": [],
+                                                 "ports_udp": [], "macs": []}
 
     async def toggle_incoming_block(self) -> bool:
         fw = self._fw()
@@ -815,7 +883,10 @@ class MazeEngine:
         if not fw:
             return FirewallState()
         now = time.monotonic()
-        if max_age > 0 and now - self._fw_state_at < max_age:
+        # A reading taken before the last change is not reused: the UI used
+        # to show the pre-block rules for up to max_age after a block.
+        fresh = self._fw_state_at > getattr(fw, "changed_at", 0.0)
+        if max_age > 0 and fresh and now - self._fw_state_at < max_age:
             return fw.state
         try:
             state = await fw.sync_state()

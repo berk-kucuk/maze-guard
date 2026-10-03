@@ -67,7 +67,20 @@ _NEVER_FILED = {
     EventType.DEVICE_FOUND, EventType.DEVICE_NEW, EventType.IP_MOVED,
     EventType.ENGINE_READY,
     EventType.MODULE_TOGGLED, EventType.PROFILE_CHANGED,
+    # These name an address that is not the attacker: the resolver a leaked
+    # query went to, the web server whose HTTPS was suppressed, a canary
+    # hostname. Filing them put 8.8.8.8 or a news site on the Threats page as
+    # "the attacker" — one click away from being blocked. The interceptor
+    # behind them is somewhere on the path and not identified by the event.
+    EventType.DNS_LEAK, EventType.SSL_STRIP, EventType.TLS_CHANGE,
+    EventType.DNS_SPOOF, EventType.ROGUE_AP,
 }
+
+# Events whose "ip" is the VICTIM (the address being impersonated, often the
+# gateway). Only an explicit "src" — the impersonator's own address, when the
+# detector could resolve it — may open a dossier; falling back to "ip" filed
+# the router itself as the attacker.
+_VICTIM_KEYED_TECHNIQUES = {"arp_poisoning"}
 
 # Score halves after this long without any new activity, so a host that
 # attacked once last week does not stay pinned at the top of the list forever.
@@ -587,8 +600,21 @@ class IncidentStore:
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
+def dossier_source(event: Event) -> str:
+    """The address this event will be (or was) filed under, "" if none.
+    Answerable before the store has seen the event — subscribers run in
+    order, and the interface hears about an attack before the store does."""
+    if event.type in _NEVER_FILED:
+        return ""
+    return _source_of(event)
+
+
 def _source_of(event: Event) -> str:
     data = event.data or {}
+    if (event.type == EventType.ARP_SPOOF
+            or data.get("technique") in _VICTIM_KEYED_TECHNIQUES):
+        src = data.get("src")
+        return src if isinstance(src, str) else ""
     for key in ("src", "ip", "remote_ip", "attacker"):
         val = data.get(key)
         if isinstance(val, str) and val:

@@ -84,3 +84,61 @@ def family(ip: str) -> str:
 def same_family(a: str, b: str) -> bool:
     fa, fb = family(a), family(b)
     return bool(fa) and fa == fb
+
+
+class AddressSet:
+    """User-entered addresses and networks, matched the way people mean them.
+
+    The whitelist accepted "10.0.0.0/8" in the interface while every detector
+    compared it with ``src in set(...)`` — an exact string match no address
+    ever makes, so a whitelisted network was silently not whitelisted. Each
+    detector also took its own copy at startup, so an entry added in Settings
+    did nothing until a restart. One instance is shared by every detector and
+    updated in place.
+    """
+
+    def __init__(self, entries=()):
+        self._exact: set[str] = set()
+        self._nets: list = []
+        self.replace(entries)
+
+    @classmethod
+    def of(cls, entries) -> "AddressSet":
+        """Share an existing set rather than copying it."""
+        return entries if isinstance(entries, cls) else cls(entries or ())
+
+    def replace(self, entries) -> None:
+        exact, nets = set(), []
+        for raw in entries or ():
+            text = str(raw).strip()
+            if not text:
+                continue
+            if "/" in text:
+                try:
+                    nets.append(ipaddress.ip_network(text, strict=False))
+                    continue
+                except ValueError:
+                    pass
+            exact.add(text)
+        self._exact, self._nets = exact, nets
+
+    def __contains__(self, ip) -> bool:
+        if not ip:
+            return False
+        if ip in self._exact:
+            return True
+        if not self._nets:
+            return False
+        addr = parse(ip)
+        return addr is not None and any(
+            addr in net for net in self._nets if net.version == addr.version)
+
+    def __iter__(self):
+        yield from self._exact
+        yield from (str(n) for n in self._nets)
+
+    def __len__(self) -> int:
+        return len(self._exact) + len(self._nets)
+
+    def __repr__(self) -> str:
+        return f"AddressSet({sorted(self)})"

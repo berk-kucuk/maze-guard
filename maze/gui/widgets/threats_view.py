@@ -10,30 +10,35 @@ from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QSplitter, QTableWidget,
-    QTableWidgetItem, QHeaderView, QLabel, QPushButton, QTextEdit,
-    QFrame, QFileDialog, QMessageBox,
+    QTableWidgetItem, QLabel, QPushButton, QTextEdit,
+    QFrame, QFileDialog, QMessageBox, QMenu, QApplication,
 )
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
+from maze.gui.widgets.common import attach_empty_state, setup_table
+
 SEVERITY_COLORS = {
     "critical": "#ff1744",
-    "high":     "#ff3d00",
-    "medium":   "#ffab00",
-    "low":      "#ffd54f",
-    "info":     "#888888",
+    "high":     "#ff4d2e",
+    "medium":   "#f5a524",
+    "low":      "#e8c547",
+    "info":     "#8b919a",
 }
 
 
-def _fmt_ago(when: datetime) -> str:
+def _fmt_ago(when: datetime, t=None) -> str:
     secs = max(0, int((datetime.now() - when).total_seconds()))
     if secs < 60:
-        return f"{secs}s ago"
-    if secs < 3600:
-        return f"{secs // 60}m ago"
-    if secs < 86400:
-        return f"{secs // 3600}h ago"
-    return f"{secs // 86400}d ago"
+        n, unit = secs, "s"
+    elif secs < 3600:
+        n, unit = secs // 60, "m"
+    elif secs < 86400:
+        n, unit = secs // 3600, "h"
+    else:
+        n, unit = secs // 86400, "d"
+    fmt = t(f"ago_{unit}") if t else "{n}" + unit + " ago"
+    return fmt.format(n=n)
 
 
 class ThreatsView(QWidget):
@@ -57,13 +62,13 @@ class ThreatsView(QWidget):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 12, 16, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(24, 16, 24, 20)
+        root.setSpacing(12)
 
         root.addLayout(self._build_toolbar())
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.setHandleWidth(6)
+        splitter.setHandleWidth(12)
         splitter.addWidget(self._build_table())
         splitter.addWidget(self._build_detail())
         splitter.setSizes([520, 520])
@@ -76,27 +81,25 @@ class ThreatsView(QWidget):
         row.setSpacing(8)
 
         self._summary = QLabel("")
-        self._summary.setStyleSheet("font-size: 12px; color: #888;")
+        self._summary.setObjectName("muted")
         row.addWidget(self._summary)
         row.addStretch()
 
         self._block_btn = QPushButton()
-        self._block_btn.setFixedHeight(28)
+        self._block_btn.setObjectName("primary")
         self._block_btn.clicked.connect(self._toggle_block)
         row.addWidget(self._block_btn)
 
         self._scan_btn = QPushButton()
-        self._scan_btn.setFixedHeight(28)
         self._scan_btn.clicked.connect(self._rescan)
         row.addWidget(self._scan_btn)
 
         self._export_btn = QPushButton()
-        self._export_btn.setFixedHeight(28)
         self._export_btn.clicked.connect(self._export)
         row.addWidget(self._export_btn)
 
         self._clear_btn = QPushButton()
-        self._clear_btn.setFixedHeight(28)
+        self._clear_btn.setObjectName("danger")
         self._clear_btn.clicked.connect(self._clear)
         row.addWidget(self._clear_btn)
 
@@ -116,18 +119,13 @@ class ThreatsView(QWidget):
         layout.addWidget(self._table_title)
 
         self._table = QTableWidget(0, 5)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setAlternatingRowColors(True)
-        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        setup_table(self._table, stretch=0, fit=(1, 2, 3, 4))
+        self._table.setStyleSheet("QTableWidget { border: none; }")
         self._table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self._table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch)
-        for col, width in ((1, 90), (2, 60), (3, 90), (4, 80)):
-            self._table.setColumnWidth(col, width)
-            self._table.horizontalHeader().setSectionResizeMode(
-                col, QHeaderView.ResizeMode.Fixed)
         self._table.itemSelectionChanged.connect(self._on_select)
+        self._table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._table.customContextMenuRequested.connect(self._menu)
+        self._empty = attach_empty_state(self._table, "")
         layout.addWidget(self._table)
         return frame
 
@@ -144,7 +142,7 @@ class ThreatsView(QWidget):
 
         self._detail = QTextEdit()
         self._detail.setReadOnly(True)
-        self._detail.setStyleSheet("font-family: monospace; font-size: 12px;")
+        self._detail.setStyleSheet("QTextEdit { border: none; background: transparent; }")
         layout.addWidget(self._detail)
         return frame
 
@@ -184,7 +182,7 @@ class ThreatsView(QWidget):
             self._table.setItem(row, 1, sev)
 
             self._table.setItem(row, 2, QTableWidgetItem(str(int(att.score()))))
-            self._table.setItem(row, 3, QTableWidgetItem(_fmt_ago(att.last_seen)))
+            self._table.setItem(row, 3, QTableWidgetItem(_fmt_ago(att.last_seen, s.t)))
 
             status = QTableWidgetItem(
                 s.t("threats_is_blocked") if att.blocked else "—")
@@ -196,11 +194,48 @@ class ThreatsView(QWidget):
                 self._table.selectRow(row)
 
         if not attackers:
-            self._detail.setPlainText(s.t("threats_empty"))
+            self._detail.setPlainText(s.t("threats_select_hint"))
             self._selected_ip = None
             self._update_buttons(None)
         elif self._selected_ip:
             self._show_detail(self._selected_ip)
+
+    def select(self, ip: str) -> bool:
+        """Show the dossier for ``ip``. False if there is none."""
+        if self._engine.incidents.get(ip) is None:
+            return False
+        self._selected_ip = ip
+        self.refresh()
+        self._show_detail(ip)
+        return True
+
+    def _menu(self, pos) -> None:
+        row = self._table.rowAt(pos.y())
+        if row < 0:
+            return
+        self._table.selectRow(row)
+        att = self._engine.incidents.get(self._selected_ip or "")
+        if att is None:
+            return
+        s = self._state
+        menu = QMenu(self)
+        act_block = menu.addAction(s.t("threats_unblock") if att.blocked
+                                   else s.t("threats_block"))
+        act_scan = menu.addAction(s.t("threats_rescan"))
+        act_export = menu.addAction(s.t("threats_export"))
+        menu.addSeparator()
+        act_copy = menu.addAction(s.t("threats_copy_ip"))
+        for act in (act_block, act_scan):
+            act.setEnabled(not self._busy)
+        chosen = menu.exec(self._table.viewport().mapToGlobal(pos))
+        if chosen is act_block:
+            self._toggle_block()
+        elif chosen is act_scan:
+            self._rescan()
+        elif chosen is act_export:
+            self._export()
+        elif chosen is act_copy:
+            QApplication.clipboard().setText(att.ip)
 
     def _on_select(self) -> None:
         items = self._table.selectedItems()
@@ -224,7 +259,7 @@ class ThreatsView(QWidget):
             f"   ({int(att.score())}/100)",
             f"{s.t('threats_first_seen')}: {att.first_seen:%Y-%m-%d %H:%M:%S}",
             f"{s.t('threats_last_seen')}:  {att.last_seen:%Y-%m-%d %H:%M:%S}"
-            f"  ({_fmt_ago(att.last_seen)})",
+            f"  ({_fmt_ago(att.last_seen, s.t)})",
             "",
             f"── {s.t('threats_identity')} ──",
             f"IP:        {att.ip}",
@@ -404,5 +439,6 @@ class ThreatsView(QWidget):
         self._scan_btn.setText(s.t("threats_rescan"))
         self._export_btn.setText(s.t("threats_export"))
         self._clear_btn.setText(s.t("threats_clear"))
+        self._empty.label.setText(s.t("threats_empty"))
         self._block_btn.setText(s.t("threats_block"))
         self.refresh()

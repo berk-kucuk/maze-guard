@@ -25,7 +25,6 @@ from pathlib import Path
 _SOCK_DIR  = "/run/maze"
 _SOCK_PATH = "/run/maze/maze.sock"
 _GROUP     = "maze"
-_IP_RE     = re.compile(r'^\d{1,3}(\.\d{1,3}){3}(/\d{1,2})?$')
 # firewall-cmd flags that Maze Guard is allowed to use via the helper.
 # Anything else (panic-on, --direct, --remove-service=ssh, ...) is rejected,
 # so a maze-group member can't brick the system through the socket.
@@ -115,16 +114,30 @@ def _fwc_address_ok(text: str) -> bool:
     return net.prefixlen >= floor
 
 
-def _fwc_rule_ok(arg: str) -> bool:
-    """Full validation of one rich-rule string: shape, then blast radius."""
-    for rx in _FWC_RULE_RES:
-        m = rx.match(arg)
+def _fwc_rule_parse(arg) -> tuple[str, str] | None:
+    """("addr", network) / ("mac", mac) / ("port", "") for a rule this helper
+    accepts, None for anything else.
+
+    fullmatch, not match: `$` also matches before a trailing newline, so the
+    anchored patterns used to accept a rule with one appended.
+    """
+    if not isinstance(arg, str) or len(arg) > 200:
+        return None
+    for kind, rx in zip(("addr", "addr", "port", "mac"), _FWC_RULE_RES):
+        m = rx.fullmatch(arg)
         if not m:
             continue
-        # Only the two source-address patterns capture a group; port and MAC
-        # rules carry no address to size up.
-        return _fwc_address_ok(m.group(1)) if m.groups() else True
-    return False
+        if kind == "addr":
+            return (kind, m.group(1)) if _fwc_address_ok(m.group(1)) else None
+        if kind == "mac":
+            return kind, re.search(r"mac=(\S+)", arg).group(1).lower()
+        return kind, ""
+    return None
+
+
+def _fwc_rule_ok(arg: str) -> bool:
+    """Full validation of one rich-rule string: shape, then blast radius."""
+    return _fwc_rule_parse(arg) is not None
 
 
 # Zone names accepted after --zone. The full built-in set is allowed because
@@ -137,13 +150,20 @@ _FWC_SAFE_ZONES  = ("public", "home", "drop", "block", "internal", "work",
 _SYSCTL_ALLOWED = {
     # Fingerprint normalisation. Every one of these only changes how this host
     # presents itself; none of them can open a port, grant access or weaken a
-    # filter, which is why they are safe to expose on this socket.
-    "net.ipv4.ip_default_ttl",
-    "net.ipv6.conf.all.hop_limit",
-    "net.ipv4.tcp_timestamps",
+    # filter, which is why they are safe to expose on this socket — within
+    # these bounds. "Digits only" used to be the whole check, and a TTL or hop
+    # limit of 1 is a quiet way to take the machine off the internet: every
+    # packet would die at the first router.
+    "net.ipv4.ip_default_ttl":     (32, 255),
+    "net.ipv6.conf.all.hop_limit": (32, 255),
+    "net.ipv4.tcp_timestamps":     (0, 2),
     # Retained so a GUI older than this daemon can still restore what it set.
-    "net.ipv4.tcp_window_scaling",
+    "net.ipv4.tcp_window_scaling": (0, 1),
 }
+
+# Bumped whenever the request vocabulary changes, so the GUI can tell a daemon
+# that predates a fix from a current one instead of failing obscurely.
+PROTOCOL = 2
 # systemd units the helper may stop/start (hostname/mDNS hiding).
 #
 # The .socket unit belongs here as much as the service does: it is configured
@@ -164,6 +184,9 @@ _FW_SVC_ACTIONS = {"start", "stop", "restart", "is-active", "is-enabled",
 # Adding protection is unauthenticated; removing it is not. See
 # packaging/org.mazeguard.policy for the prompt text and polkit defaults.
 _POLKIT_ACTION  = "org.mazeguard.disable-protection"
+# Blocks that would cut this machine off its own network (a whole range, the
+# gateway, the DNS server) are not "adding protection" and are asked about.
+_POLKIT_ACTION_BLOCK = "org.mazeguard.block-network"
 _AUTH_TIMEOUT   = 60.0     # the user needs time to read the prompt and type
 # firewall-cmd arguments that reduce protection, and therefore need consent.
 # Removing a rule is judged by WHAT is being removed, not that a removal is
@@ -177,18 +200,137 @@ _FWC_REMOVE_RULE = "--remove-rich-rule"
 
 
 def _needs_consent(args: list[str]) -> str:
-    """Describe why this command needs authorisation, or "" if it does not."""
+    """Describe why this command needs authorisation, or "" if it does not.
+
+    Every argument is examined, not the first match: firewall-cmd accepts a
+    flag more than once, and checking only the first --remove-rich-rule let a
+    harmless port-rule removal carry an attacker-block removal past consent.
+    """
     if _FWC_LOWERS_SHIELD in args:
         return "lower the incoming-traffic shield"
-    if _FWC_REMOVE_RULE in args:
-        rule = args[args.index(_FWC_REMOVE_RULE) + 1] if \
-            args.index(_FWC_REMOVE_RULE) + 1 < len(args) else ""
+    for i, arg in enumerate(args):
+        if arg != _FWC_REMOVE_RULE:
+            continue
+        rule = args[i + 1] if i + 1 < len(args) else ""
         # A block by hardware address is as much an attacker block as one by
         # IP — it is the variant that survives the attacker renewing a DHCP
-        # lease — so removing it needs the same consent. Checking only for
-        # "source address=" let any maze-group process lift MAC blocks silently.
-        if "source address=" in rule or "source mac=" in rule:
+        # lease — so removing it needs the same consent.
+        if "source address=" in str(rule) or "source mac=" in str(rule):
             return "remove a block on an attacker"
+    return ""
+
+
+# Every shape of firewall-cmd invocation Maze Guard actually sends. Anything
+# else is refused outright, which makes argument smuggling (a second action
+# riding on a legal one, a flag where a rule should be) impossible to express.
+_FWC_QUERIES = {"--list-all", "--list-rich-rules", "--get-default-zone", "--reload"}
+_FWC_TARGETS = {"--set-target=DROP", "--set-target=default"}
+_FWC_MAX_ARGS = 6
+
+
+def _fwc_check(args) -> tuple[str, str]:
+    """Validate one firewall-cmd request. Returns (error, consent_reason).
+
+    error is "" when the request is acceptable; consent_reason is "" when it
+    may run without asking the user.
+    """
+    if (not isinstance(args, list) or not 2 <= len(args) <= _FWC_MAX_ARGS
+            or args[0] != "firewall-cmd"
+            or not all(isinstance(a, str) for a in args)):
+        return "fw_cmd requires firewall-cmd args", ""
+    rest = args[1:]
+    if len(rest) == 1 and rest[0] in _FWC_QUERIES:
+        return "", ""
+    i = 0
+    if i < len(rest) and rest[i] == "--permanent":
+        i += 1
+    if i < len(rest) and rest[i] == "--zone":
+        if i + 1 >= len(rest) or rest[i + 1] not in _FWC_SAFE_ZONES:
+            return "zone not allowed", ""
+        i += 2
+    tail = rest[i:]
+    if len(tail) == 1 and tail[0] in _FWC_TARGETS:
+        return "", _needs_consent(args)
+    if len(tail) == 2 and tail[0] in ("--add-rich-rule", _FWC_REMOVE_RULE):
+        parsed = _fwc_rule_parse(tail[1])
+        if parsed is None:
+            return f"disallowed firewall-cmd argument: {tail[1][:80]}", ""
+        if tail[0] == _FWC_REMOVE_RULE:
+            return "", _needs_consent(args)
+        return "", _block_needs_consent(*parsed)
+    bad = next((a for a in rest if a not in _FWC_SAFE_FLAGS
+                and a not in _FWC_SAFE_ZONES), rest[-1] if rest else "")
+    return f"disallowed firewall-cmd argument: {bad[:80]}", ""
+
+
+# ── What a block may not silently cut off ─────────────────────────────────────
+# Adding a drop rule is "adding protection" and runs without a prompt. Two
+# kinds of block are not protection at all, though: one covering a whole range
+# rather than one host, and one aimed at this machine's own gateway or DNS
+# server — either takes the machine off its network. Maze Guard itself only
+# ever blocks single attacking hosts and never infrastructure, so these only
+# arrive from a person typing them, who can answer the prompt, or from
+# something abusing the socket, which cannot.
+
+def _default_gateways() -> set[str]:
+    gws: set[str] = set()
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            f = line.split()
+            if len(f) > 2 and f[1] == "00000000" and f[2] != "00000000":
+                gws.add(str(ipaddress.IPv4Address(bytes.fromhex(f[2])[::-1])))
+    except Exception:
+        pass
+    try:
+        for line in Path("/proc/net/ipv6_route").read_text().splitlines():
+            f = line.split()
+            if len(f) > 4 and f[0] == "0" * 32 and f[1] == "00" and f[4] != "0" * 32:
+                gws.add(str(ipaddress.IPv6Address(bytes.fromhex(f[4]))))
+    except Exception:
+        pass
+    return gws
+
+
+def _nameservers() -> set[str]:
+    out: set[str] = set()
+    for path in ("/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"):
+        try:
+            for line in Path(path).read_text().splitlines():
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    out.add(parts[1].split("%", 1)[0])
+        except Exception:
+            continue
+    return out
+
+
+def _gateway_macs(gateways: set[str]) -> set[str]:
+    macs: set[str] = set()
+    try:
+        for line in Path("/proc/net/arp").read_text().splitlines()[1:]:
+            f = line.split()
+            if len(f) >= 4 and f[0] in gateways:
+                macs.add(f[3].lower())
+    except Exception:
+        pass
+    return macs
+
+
+def _block_needs_consent(kind: str, value: str) -> str:
+    if kind == "addr":
+        net = ipaddress.ip_network(value, strict=False)
+        if net.prefixlen < net.max_prefixlen:
+            return "block a whole address range"
+        infra = _default_gateways() | _nameservers()
+        for ip in infra:
+            try:
+                if ipaddress.ip_address(ip) in net:
+                    return "block this machine's gateway or DNS server"
+            except ValueError:
+                continue
+    elif kind == "mac":
+        if value in _gateway_macs(_default_gateways()):
+            return "block this machine's gateway"
     return ""
 
 
@@ -231,7 +373,8 @@ def _peer_name(writer: asyncio.StreamWriter) -> str:
     return f"pid={pid} uid={uid} comm={comm}"
 
 
-async def _authorized(writer: asyncio.StreamWriter, what: str) -> tuple[bool, str]:
+async def _authorized(writer: asyncio.StreamWriter, what: str,
+                      action: str = _POLKIT_ACTION) -> tuple[bool, str]:
     """Ask polkit whether this caller may turn a protection off.
 
     The socket's group check answers "is this the desktop user?", which is not
@@ -257,7 +400,7 @@ async def _authorized(writer: asyncio.StreamWriter, what: str) -> tuple[bool, st
         return False, "could not identify the calling process"
 
     r = await _run(
-        ["pkcheck", "--action-id", _POLKIT_ACTION,
+        ["pkcheck", "--action-id", action,
          "--process", f"{pid},{start},{uid}", "--allow-user-interaction"],
         timeout=_AUTH_TIMEOUT,
     )
@@ -338,16 +481,42 @@ def _peer_allowed(writer: asyncio.StreamWriter) -> bool:
         return False
 
 
+# A client that stops reading must not make root's memory grow: past the
+# soft limit its push events are dropped, past the hard limit it is cut off.
+# The GUI reads continuously and never comes near either.
+_PUSH_BUFFER_SOFT = 1 << 20          # 1 MiB queued for one client
+_PUSH_BUFFER_HARD = 8 << 20          # 8 MiB: the client is not reading at all
+_MAX_CLIENTS = 16
+
+
+def _deliver(data: bytes) -> None:
+    """Runs on the event loop: hand one event to every client that keeps up."""
+    for w in list(_clients):
+        try:
+            queued = w.transport.get_write_buffer_size()
+            if queued > _PUSH_BUFFER_HARD:
+                print("maze-helper: dropping a client that stopped reading "
+                      f"({queued} bytes queued)", file=sys.stderr, flush=True)
+                w.close()
+                if w in _clients:
+                    _clients.remove(w)
+                continue
+            if queued > _PUSH_BUFFER_SOFT:
+                continue
+            w.write(data)
+        except Exception:
+            pass
+
+
 def _push(event: dict) -> None:
     _CAPTURE["pushed"] += 1
     if not _loop or not _clients:
         return
     data = (json.dumps(event) + "\n").encode()
-    for w in list(_clients):
-        try:
-            _loop.call_soon_threadsafe(w.write, data)
-        except Exception:
-            pass
+    try:
+        _loop.call_soon_threadsafe(_deliver, data)
+    except Exception:
+        pass
 
 
 def _get_iface_ips(iface: str) -> set[str]:
@@ -463,7 +632,6 @@ def _tcp_flag_str(flags) -> str:
 def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int,
                 should_stop=None) -> None:
     from scapy.all import ARP, DHCP, ICMP, IP, IPv6, TCP, UDP, sniff
-    from scapy.layers.inet6 import ICMPv6ND_RA, ICMPv6EchoRequest
 
     own_ips: set[str] = _get_iface_ips(iface)
     own_ips_refreshed_at: float = time.monotonic()
@@ -648,6 +816,17 @@ def _sniff_thread(iface: str) -> None:
     backoff = 1.0
     _CAPTURE["started"] = time.monotonic()
     while True:
+        if not current:
+            # No usable link yet (early boot, cable out, WiFi still joining).
+            # Capturing on a guessed name such as "eth0" only produced a
+            # "Device does not exist" error on every boot; wait for a real one.
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 10.0)
+            try:
+                current = _resolve_iface("")
+            except Exception:
+                current = ""
+            continue
         _CAPTURE["iface"] = current
         try:
             _sniff_once(current, limiter, stop_after=_SLICE_SECONDS,
@@ -782,14 +961,28 @@ def _fw_forget() -> None:
     _fw_cache.clear()
 
 
+def _field(req: dict, name: str) -> str:
+    """A string field of a request, or "" — never another type. Lists and
+    dicts where a string belongs used to reach set lookups and raise."""
+    value = req.get(name, "")
+    return value if isinstance(value, str) and len(value) <= 256 else ""
+
+
 async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
     """Execute one request and return its response envelope."""
-    cmd    = req.get("cmd", "")
+    if not isinstance(req, dict):
+        return {"id": 0, "ok": False, "err": "request must be a JSON object"}
+    cmd    = _field(req, "cmd")
     req_id = req.get("id", 0)
+    if not isinstance(req_id, int) or isinstance(req_id, bool):
+        req_id = 0
     resp: dict = {"id": req_id, "ok": False}
 
     if cmd == "ping":
         resp["ok"] = True
+
+    elif cmd == "version":
+        resp.update(ok=True, data={"protocol": PROTOCOL})
 
     elif cmd == "fw_list_all":
         cached = _fw_cached("list_all")
@@ -804,39 +997,28 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
             _fw_remember("list_all", {k: resp[k] for k in ("ok", "data")})
 
     elif cmd == "fw_cmd":
-        # Validate: only allow a curated whitelist of firewall-cmd flags
-        # and rule strings. Anything else (panic-on, --direct, etc.)
-        # is rejected so a maze-group member can't brick the system.
+        # Only the exact invocation shapes Maze Guard sends are accepted —
+        # see _fwc_check. Anything else (panic-on, --direct, a second action
+        # smuggled after a legal one) is refused before anything runs.
         args = req.get("args", [])
-        if not (isinstance(args, list) and len(args) >= 1
-                and args[0] == "firewall-cmd"):
-            resp["err"] = "fw_cmd requires firewall-cmd args"
+        err, consent_for = _fwc_check(args)
+        if err:
+            resp["err"] = err
         else:
-            bad = False
-            for a in args[1:]:
-                if a in _FWC_SAFE_FLAGS:
-                    continue
-                if a in _FWC_SAFE_ZONES:
-                    continue
-                if _fwc_rule_ok(a):
-                    continue
-                bad = True
-                resp["err"] = f"disallowed firewall-cmd argument: {a}"
-                break
-            if not bad:
-                _audit(writer, f"fw_cmd {' '.join(args[1:])}")
-                consent_for = _needs_consent(args)
-                allowed, why = ((True, "") if not consent_for else
-                                await _authorized(writer, consent_for))
-                if not allowed:
-                    resp["err"] = why
-                elif not await _firewalld_active():
-                    resp["err"] = "firewalld is not running"
-                else:
-                    r = await _run(args, timeout=20.0)
-                    resp.update(ok=(r.returncode == 0 or r.returncode == 252),
-                                err=r.stderr.strip())
-                    _fw_forget()
+            _audit(writer, f"fw_cmd {' '.join(args[1:])}")
+            action = (_POLKIT_ACTION_BLOCK if consent_for.startswith("block")
+                      else _POLKIT_ACTION)
+            allowed, why = ((True, "") if not consent_for else
+                            await _authorized(writer, consent_for, action))
+            if not allowed:
+                resp["err"] = why
+            elif not await _firewalld_active():
+                resp["err"] = "firewalld is not running"
+            else:
+                r = await _run(args, timeout=20.0)
+                resp.update(ok=(r.returncode == 0 or r.returncode == 252),
+                            err=r.stderr.strip())
+                _fw_forget()
 
     elif cmd == "fw_list" and _fw_cached("list") is not None:
         resp.update(_fw_cached("list"))
@@ -916,7 +1098,7 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
             _fw_remember("state", {"ok": True, "data": state})
 
     elif cmd == "fw_service":
-        action = req.get("action", "")
+        action = _field(req, "action")
         if action not in _FW_SVC_ACTIONS:
             resp["err"] = "action not allowed"
         else:
@@ -937,8 +1119,8 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                             data=r.stdout.strip(), err=r.stderr.strip())
 
     elif cmd == "svc":
-        action = req.get("action", "")
-        unit   = req.get("unit", "")
+        action = _field(req, "action")
+        unit   = _field(req, "unit")
         if unit not in _SVC_ALLOWED or action not in _SVC_ACTIONS:
             resp["err"] = "service or action not allowed"
         else:
@@ -954,6 +1136,13 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
         # Build the full connection→process map from root so the GUI can
         # attribute connections owned by other users (incl. root daemons),
         # which an unprivileged /proc scan cannot see.
+        # Root reads every process's command line; the caller is only entitled
+        # to its own. Another user's arguments can carry secrets (a password
+        # on a command line, a token in a URL), and hidepid= exists precisely
+        # to keep them private — this socket must not be the way around it.
+        # Other owners' processes are reported by their program path only.
+        caller = _peer_uid(writer) if writer is not None else -1
+
         def _collect() -> list[dict]:
             from maze.protection.process_map import (
                 _read_proc_net_tcp, _build_inode_map, _unwrap_mapped)
@@ -969,6 +1158,13 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                 if not res:
                     continue
                 pid, name, exe, cmdline = res
+                if caller != 0:
+                    try:
+                        owner = os.stat(f"/proc/{pid}").st_uid
+                    except OSError:
+                        owner = -2
+                    if owner != caller:
+                        cmdline = cmdline.split(" ", 1)[0] if cmdline else ""
                 conns.append({
                     "pid": pid, "process": name,
                     "exe": exe, "cmdline": cmdline,
@@ -993,7 +1189,7 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
         resp.update(ok=True, data=stats)
 
     elif cmd == "sysctl_get":
-        key = req.get("key", "")
+        key = _field(req, "key")
         if key not in _SYSCTL_ALLOWED:
             resp["err"] = "disallowed sysctl key"
         else:
@@ -1002,12 +1198,17 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
                         err=r.stderr.strip())
 
     elif cmd == "sysctl_set":
-        key   = req.get("key", "")
-        value = str(req.get("value", ""))
-        if key not in _SYSCTL_ALLOWED:
+        key   = _field(req, "key")
+        value = req.get("value", "")
+        value = str(value) if isinstance(value, (str, int)) and \
+            not isinstance(value, bool) else ""
+        bounds = _SYSCTL_ALLOWED.get(key)
+        if bounds is None:
             resp["err"] = "disallowed sysctl key"
-        elif not re.match(r'^\d+$', value):
-            resp["err"] = "invalid sysctl value (digits only)"
+        elif not re.fullmatch(r"[0-9]{1,3}", value) or \
+                not bounds[0] <= int(value) <= bounds[1]:
+            resp["err"] = (f"invalid sysctl value for {key} "
+                           f"(allowed {bounds[0]}–{bounds[1]})")
         else:
             _audit(writer, f"sysctl {key}={value}")
             r = await _run(["sysctl", "-w", f"{key}={value}"], timeout=5.0)
@@ -1022,6 +1223,11 @@ async def _dispatch(req: dict, writer: asyncio.StreamWriter) -> dict:
 async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     # Verify the caller is allowed (maze group member / invoking user / root)
     if not _peer_allowed(writer):
+        writer.close()
+        return
+    if len(_clients) >= _MAX_CLIENTS:
+        # Each connection holds a task and buffers; the GUI needs one.
+        _audit(writer, "refusing connection: too many clients")
         writer.close()
         return
 
@@ -1046,7 +1252,9 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
             try:
                 resp = await _dispatch(req, writer)
             except Exception as exc:
-                resp = {"id": req.get("id", 0), "ok": False, "err": str(exc)}
+                rid = req.get("id", 0)
+                resp = {"id": rid if isinstance(rid, int) else 0, "ok": False,
+                        "err": f"internal error: {exc.__class__.__name__}"}
             try:
                 writer.write((json.dumps(resp) + "\n").encode())
                 await writer.drain()
@@ -1073,7 +1281,12 @@ async def _handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) ->
                 continue
             try:
                 req = json.loads(line)
-            except json.JSONDecodeError:
+            except (ValueError, RecursionError):
+                # ValueError covers JSONDecodeError and invalid UTF-8; a
+                # deeply nested payload raises RecursionError instead, and
+                # that used to end the connection handler with a traceback.
+                continue
+            if not isinstance(req, dict):
                 continue
             while len(pending) >= _MAX_PENDING:
                 # Wait for room rather than queueing without limit.
@@ -1152,6 +1365,13 @@ async def _serve(sock_path: str, iface: str) -> None:
 
     threading.Thread(target=_sniff_thread, args=(iface,), daemon=True).start()
 
+    # systemd: report ready, then keep proving the event loop is alive. The
+    # watchdog ping comes from the loop itself, so a helper that is running
+    # but wedged stops pinging and is restarted instead of sitting there
+    # unresponsive while the GUI waits on it.
+    _sd_notify("READY=1")
+    watchdog = asyncio.create_task(_watchdog_loop())
+
     # Stop on SIGTERM by waking this coroutine, not with loop.stop(): under
     # asyncio.run() stopping the loop while the main task is still pending
     # raises "Event loop stopped before Future completed", which systemd then
@@ -1172,6 +1392,38 @@ async def _serve(sock_path: str, iface: str) -> None:
         # _run, kills their child processes.
         for w in list(_clients):
             w.close()
+        watchdog.cancel()
+        _sd_notify("STOPPING=1")
+
+
+def _sd_notify(message: str) -> bool:
+    """Send one sd_notify(3) message. A no-op outside systemd."""
+    addr = os.environ.get("NOTIFY_SOCKET", "")
+    if not addr:
+        return False
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        with _socket.socket(_socket.AF_UNIX,
+                            _socket.SOCK_DGRAM | _socket.SOCK_CLOEXEC) as sock:
+            sock.connect(addr)
+            sock.sendall(message.encode())
+        return True
+    except OSError:
+        return False
+
+
+async def _watchdog_loop() -> None:
+    try:
+        usec = int(os.environ.get("WATCHDOG_USEC", "0"))
+    except ValueError:
+        usec = 0
+    if usec <= 0:
+        return
+    interval = max(1.0, usec / 1_000_000 / 2)
+    while True:
+        _sd_notify("WATCHDOG=1")
+        await asyncio.sleep(interval)
 
 
 def _resolve_iface(arg: str) -> str:
@@ -1180,7 +1432,11 @@ def _resolve_iface(arg: str) -> str:
         operstate = Path("/sys/class/net") / arg / "operstate"
         if operstate.exists() and operstate.read_text().strip() in ("up", "unknown"):
             return arg
-    sys.path.insert(0, str(Path(__file__).parent.parent))
+    # Called about once a second by the capture's stop filter: inserting
+    # unconditionally grew sys.path by ~86k entries a day.
+    root = str(Path(__file__).parent.parent)
+    if root not in sys.path:
+        sys.path.insert(0, root)
     try:
         from maze.utils.network_info import get_active_physical_interface
         detected = get_active_physical_interface()
@@ -1188,7 +1444,8 @@ def _resolve_iface(arg: str) -> str:
             return detected
     except Exception:
         pass
-    return arg or "eth0"
+    # Nothing usable: say so with "" and let the capture wait for a link.
+    return ""
 
 
 if __name__ == "__main__":
@@ -1199,5 +1456,12 @@ if __name__ == "__main__":
     # SUDO_UID is set only in legacy sudo mode; it is absent under systemd,
     # which is how the helper distinguishes daemon mode from sudo mode.
     _owner_uid = int(os.environ.get("SUDO_UID", "0"))
+    # The unit runs Python with -I (isolated): no script directory on
+    # sys.path, no PYTHON* environment, no user site-packages. The package
+    # root is added explicitly — and only it — so `maze.*` imports resolve to
+    # the root-owned install and nothing else can shadow a module.
+    _root = str(Path(__file__).resolve().parent.parent)
+    if _root not in sys.path:
+        sys.path.insert(0, _root)
     iface = _resolve_iface(sys.argv[1] if len(sys.argv) > 1 else "")
     asyncio.run(_serve(_SOCK_PATH, iface))

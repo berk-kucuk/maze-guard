@@ -468,7 +468,7 @@ class TestPopupDamping(unittest.TestCase):
             self.skipTest(f"dashboard not importable: {exc}")
         self.fn = Dashboard._popup_allowed
         self.host = types.SimpleNamespace(
-            _popup_last={}, _popup_times=[],
+            _popup_last={}, _popup_times={},
             _POPUP_REPEAT=Dashboard._POPUP_REPEAT,
             _POPUP_WINDOW=Dashboard._POPUP_WINDOW,
             _POPUP_BURST=Dashboard._POPUP_BURST)

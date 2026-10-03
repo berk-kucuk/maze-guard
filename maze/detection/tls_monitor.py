@@ -96,7 +96,12 @@ class TLSMonitor:
         while True:
             await asyncio.sleep(300)
             for host in _CANARY_HOSTS:
-                await self.check(host)
+                try:
+                    await self.check(host)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # never let one bad fetch end the loop
+                    log.warning(f"TLSMonitor: check of {host} failed — {exc}")
 
     async def check(self, hostname: str, port: int = 443) -> None:
         """One canary, one verdict.

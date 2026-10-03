@@ -42,6 +42,7 @@ class HostnameHider:
     def __init__(self):
         self._was_running: dict[str, bool] = {}
         self._unit_present = True
+        self._unit_masked = False
         self._helper = None
 
     # ── lifecycle ────────────────────────────────────────────────────────
@@ -58,6 +59,8 @@ class HostnameHider:
         # nothing to do, and reporting a bare "Active" would imply it had hidden
         # something. It says so instead.
         self._unit_present = await asyncio.to_thread(self._unit_exists)
+        self._unit_masked = (not self._unit_present and
+                             await asyncio.to_thread(self._unit_load_state) == "masked")
 
         self._was_running = {}
         for unit in _UNITS:
@@ -85,6 +88,9 @@ class HostnameHider:
 
     def status_detail(self) -> str:
         if not self._unit_present:
+            if self._unit_masked:
+                return ("avahi is masked (disabled system-wide) — this machine "
+                        "cannot advertise itself over mDNS at all")
             return ("avahi is not installed — this machine was not "
                     "advertising itself over mDNS to begin with")
         stopped = [u for u, running in self._was_running.items() if running]
@@ -106,6 +112,13 @@ class HostnameHider:
         toggle, which is what makes running it twice informative.
         """
         if not await asyncio.to_thread(self._unit_exists):
+            if await asyncio.to_thread(self._unit_load_state) == "masked":
+                # Masked is stronger than anything this module does: systemd
+                # refuses to start the unit, by socket activation or by hand.
+                return Verdict(PASS,
+                               "avahi is masked on this system, so nothing can "
+                               "announce its hostname over mDNS",
+                               ["avahi-daemon.service: masked"])
             return Verdict(INFO,
                            "avahi is not installed here, so nothing on this "
                            "machine can announce its hostname over mDNS")
@@ -161,6 +174,17 @@ class HostnameHider:
         return {u: bool(data.get(u)) for u in _UNITS}
 
     # ── helper / direct plumbing ──────────────────────────────────────────
+
+    @staticmethod
+    def _unit_load_state() -> str:
+        """systemd's LoadState for the unit: loaded, masked, not-found, …"""
+        try:
+            r = subprocess.run(
+                ["systemctl", "show", "-p", "LoadState", "--value", _UNIT],
+                capture_output=True, text=True, timeout=5)
+            return r.stdout.strip()
+        except Exception:
+            return ""
 
     @staticmethod
     def _unit_exists() -> bool:

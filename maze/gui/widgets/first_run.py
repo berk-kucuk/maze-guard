@@ -14,7 +14,6 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QCheckBox,
     QDialogButtonBox, QFrame,
 )
-from PyQt6.QtCore import Qt
 
 from maze.gui import autostart
 from maze.utils.logger import log
@@ -48,7 +47,7 @@ class FirstRunDialog(QDialog):
 
         intro = QLabel(s("fr_intro"))
         intro.setWordWrap(True)
-        intro.setStyleSheet("color: #999; font-size: 12px;")
+        intro.setObjectName("muted")
         layout.addWidget(intro)
         layout.addWidget(_separator())
 
@@ -63,8 +62,11 @@ class FirstRunDialog(QDialog):
         row.addWidget(self._iface, 1)
         layout.addLayout(row)
 
-        self._trust = QCheckBox(
-            s("fr_trust").format(network=self._network_id or s("fr_no_network")))
+        kind, _, value = self._network_id.partition(":")
+        shown = (value if kind == "wifi"
+                 else f'{s("dash_wired")} ({value})' if kind == "gw"
+                 else self._network_id or s("fr_no_network"))
+        self._trust = QCheckBox(s("fr_trust").format(network=shown))
         self._trust.setEnabled(bool(self._network_id))
         self._trust.setChecked(bool(self._network_id))
         layout.addWidget(self._trust)
@@ -82,11 +84,12 @@ class FirstRunDialog(QDialog):
 
         note = QLabel(s("fr_note"))
         note.setWordWrap(True)
-        note.setStyleSheet("color: #888; font-size: 11px;")
+        note.setObjectName("muted")
         layout.addWidget(note)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText(s("fr_start"))
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setObjectName("primary")
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
 
@@ -100,7 +103,6 @@ class FirstRunDialog(QDialog):
         if self._trust.isChecked() and self._network_id:
             if self._network_id not in cfg.trusted_networks:
                 cfg.trusted_networks.append(self._network_id)
-            cfg.auto_profile_switch = True
         if self._autostart.isEnabled():
             try:
                 autostart.enable() if self._autostart.isChecked() else autostart.disable()

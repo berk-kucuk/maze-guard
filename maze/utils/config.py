@@ -40,15 +40,15 @@ class MazeConfig:
     language: str = "en"
     profile: str = "home"
     # Switch profile by network: a network on trusted_networks gets HOME,
-    # anything else PUBLIC. On by default, because the alternative — a fresh
-    # install sitting on "home" in every café until someone finds the combo —
-    # is the wrong failure mode for a tool whose job is exactly that
-    # judgement. Until the user marks a network trusted, every network is
-    # public; the tray says so once per switch so the choice is visible.
-    auto_profile_switch: bool = True
+    # anything else PUBLIC. Off by default: network identification is not
+    # reliable enough (an unreadable SSID falls back to the gateway MAC, so the
+    # same network can answer to different ids) and a wrong verdict silently
+    # replaced the profile the user picked, on every launch. Opt-in from
+    # Settings; the profile chosen in the header is otherwise left alone.
+    auto_profile_switch: bool = False
     # Bumped when a default changes in a way existing config files should
     # adopt. load_config() applies the migrations for anything older.
-    config_version: int = 2
+    config_version: int = 3
     # Lowest threat level allowed to raise a DESKTOP (tray) notification.
     # "dangerous" (default) | "suspicious" | "off"
     #
@@ -174,14 +174,13 @@ def load_config() -> MazeConfig:
             # first-run wizard on upgrade would be a downgrade.
             if "first_run_done" not in data:
                 cfg.first_run_done = True
-            # v2: auto profile switching became the default. Every config
-            # written before that carries auto_profile_switch=false — not
-            # because anyone chose it, but because that was what save_config
-            # wrote for the old default — so it is migrated once. Someone who
-            # turns it off again from now on keeps their choice.
-            if int(data.get("config_version", 1)) < 2:
-                cfg.auto_profile_switch = True
-                cfg.config_version = 2
+            # v3: auto profile switching is opt-in again (see the field). v2
+            # turned it on for every existing config, so anything older than
+            # v3 carries a True nobody chose; it is switched off once, and
+            # turning it back on from Settings sticks.
+            if int(data.get("config_version", 1)) < 3:
+                cfg.auto_profile_switch = False
+                cfg.config_version = 3
             return cfg
         except Exception as e:
             from maze.utils.logger import log

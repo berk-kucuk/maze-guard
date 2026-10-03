@@ -19,9 +19,12 @@ def helper_socket_path() -> str:
 async def connect_helper(iface: str = "eth0"):
     """
     Connect to the running helper daemon.
-    Returns a connected HelperClient, or None if the daemon is unavailable.
+
+    Always returns a HelperClient, connected or not. A GUI autostarted at login
+    routinely beats the daemon to it, and returning None then meant nothing
+    ever retried: the whole session ran in limited mode. The engine keeps
+    reconnecting an unconnected client (see MazeEngine._helper_loop).
     """
     client = HelperClient(uid=os.getuid())
-    if await client.connect():
-        return client
-    return None
+    await client.connect()
+    return client

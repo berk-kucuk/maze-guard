@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from maze.core.verify import FAIL, INFO, NA, PASS, WARN, Verdict
+from maze.gui.theme import THREAT_COLORS
+from maze.gui.widgets.common import ToggleSwitch, chip, set_chip
 
 # Colour and one-word label per verdict. The label answers the question the
 # button asks — "is this in effect?" — rather than restating Active/Inactive,
@@ -42,17 +44,11 @@ MODULES = [
 ]
 
 
-def _polish(btn: QPushButton) -> None:
-    btn.style().unpolish(btn)
-    btn.style().polish(btn)
-    btn.update()
-
-
 class _Row:
     """One module line: name, sub-caption, status word and toggle."""
 
     def __init__(self, name_lbl: QLabel, detail_lbl: QLabel,
-                 status_lbl: QLabel, test_btn: QPushButton, btn: QPushButton):
+                 status_lbl: QLabel, test_btn: QPushButton, btn: ToggleSwitch):
         self.name = name_lbl
         self.detail = detail_lbl
         self.status = status_lbl
@@ -74,6 +70,7 @@ class ModuleStatusWidget(QWidget):
         # module's account of itself — and cleared the moment the toggle moves,
         # since it then describes a state that no longer exists.
         self._verdicts: dict[str, Verdict] = {}
+        self._cat_labels: dict[str, QLabel] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -86,16 +83,22 @@ class ModuleStatusWidget(QWidget):
 
         container = QWidget()
         self._inner = QVBoxLayout(container)
-        self._inner.setContentsMargins(24, 16, 24, 16)
-        self._inner.setSpacing(0)
+        self._inner.setContentsMargins(24, 8, 24, 20)
+        self._inner.setSpacing(14)
 
         scroll.setWidget(container)
-        layout.addWidget(scroll)
 
+        # Results of a toggle or a self-test. Above the list, where it is
+        # seen, rather than under a long scroll.
         self._msg = QLabel("")
         self._msg.setWordWrap(True)
-        self._msg.setStyleSheet("font-size: 12px; color: #888; padding: 6px 24px;")
-        layout.addWidget(self._msg)
+        self._msg.setVisible(False)
+        self._msg.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        msg_wrap = QHBoxLayout()
+        msg_wrap.setContentsMargins(24, 0, 24, 6)
+        msg_wrap.addWidget(self._msg)
+        layout.addLayout(msg_wrap)
+        layout.addWidget(scroll, 1)
 
         self._build_rows()
         state.language_changed.connect(self.retranslate)
@@ -105,37 +108,34 @@ class ModuleStatusWidget(QWidget):
 
     def _build_rows(self) -> None:
         current_cat = None
+        body = None
+        first_in_card = True
 
         for key, i18n_key, cat_key in MODULES:
             if cat_key != current_cat:
                 current_cat = cat_key
-                self._add_category_header(cat_key)
+                body = self._add_category_card(cat_key)
+                first_in_card = True
 
             name_lbl = QLabel(self._state.t(i18n_key))
-            name_lbl.setStyleSheet("font-size: 13px;")
+            name_lbl.setStyleSheet("font-size: 14px; font-weight: 600;")
 
             detail_lbl = QLabel("")
-            detail_lbl.setStyleSheet("font-size: 11px; color: #777;")
+            detail_lbl.setObjectName("muted")
             # Verdicts are written as sentences, not status codes. Without
-            # wrapping, one of them widens the whole tab.
+            # wrapping, one of them widens the whole page.
             detail_lbl.setWordWrap(True)
 
-            status_lbl = QLabel("")
-            status_lbl.setFixedWidth(90)
+            status_lbl = chip()
+            status_lbl.setMinimumWidth(84)
             status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
             test_btn = QPushButton(self._state.t("verify_btn"))
-            test_btn.setFixedWidth(64)
-            test_btn.setFixedHeight(30)
             test_btn.setToolTip(self._state.t("tip_verify"))
             test_btn.clicked.connect(lambda _, k=key: self._test(k))
 
-            btn = QPushButton("○")
-            btn.setFixedWidth(44)
-            btn.setFixedHeight(30)
-            btn.setProperty("active", False)
-            btn.clicked.connect(lambda _, k=key: self._toggle(k))
-            _polish(btn)
+            btn = ToggleSwitch()
+            btn.clicked.connect(lambda _c, k=key: self._toggle(k))
 
             if key == "fw_backend":
                 btn.setToolTip(self._state.t("tip_fw_backend"))
@@ -151,42 +151,46 @@ class ModuleStatusWidget(QWidget):
             text_col.addWidget(name_lbl)
             text_col.addWidget(detail_lbl)
 
+            if not first_in_card:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                body.addWidget(sep)
+            first_in_card = False
+
             row_widget = QWidget()
             row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 6, 0, 6)
-            row_layout.setSpacing(12)
-            row_layout.addLayout(text_col)
-            row_layout.addStretch()
+            row_layout.setContentsMargins(0, 8, 0, 8)
+            row_layout.setSpacing(14)
+            row_layout.addLayout(text_col, 1)
             row_layout.addWidget(status_lbl)
             row_layout.addWidget(test_btn)
             row_layout.addWidget(btn)
-
-            self._inner.addWidget(row_widget)
-
-            sep = QFrame()
-            sep.setFrameShape(QFrame.Shape.HLine)
-            sep.setFixedHeight(1)
-            self._inner.addWidget(sep)
+            body.addWidget(row_widget)
 
         self._inner.addStretch()
 
-    def _add_category_header(self, cat_key: str) -> None:
+    def _add_category_card(self, cat_key: str) -> QVBoxLayout:
+        frame = QFrame()
+        frame.setObjectName("card")
+        body = QVBoxLayout(frame)
+        body.setContentsMargins(18, 12, 18, 8)
+        body.setSpacing(0)
         lbl = QLabel(self._state.t(cat_key).upper())
-        lbl.setStyleSheet(
-            "font-size: 10px; font-weight: bold; letter-spacing: 2px; "
-            "color: #555555; padding-top: 16px; padding-bottom: 6px;"
-        )
-        self._inner.addWidget(lbl)
+        lbl.setObjectName("card_title")
+        body.addWidget(lbl)
+        self._cat_labels[cat_key] = lbl
+        self._inner.addWidget(frame)
+        return body
 
     def _make_toolbar(self) -> QWidget:
         bar = QWidget()
         row = QHBoxLayout(bar)
-        row.setContentsMargins(24, 12, 24, 4)
+        row.setContentsMargins(24, 16, 24, 8)
         row.setSpacing(12)
 
         self._toolbar_hint = QLabel(self._state.t("verify_hint"))
         self._toolbar_hint.setWordWrap(True)
-        self._toolbar_hint.setStyleSheet("font-size: 11px; color: #777;")
+        self._toolbar_hint.setObjectName("muted")
         row.addWidget(self._toolbar_hint, 1)
 
         self._test_all_btn = QPushButton(self._state.t("verify_all_btn"))
@@ -209,7 +213,7 @@ class ModuleStatusWidget(QWidget):
         row = self._rows[key]
         row.test.setEnabled(False)
         row.detail.setText(self._state.t("verify_running"))
-        row.detail.setStyleSheet("font-size: 11px; color: #ffab00;")
+        row.detail.setStyleSheet(f"color: {THREAT_COLORS['suspicious']};")
         row.detail.setVisible(True)
         try:
             verdict = await self._engine.verify_module(key)
@@ -263,6 +267,7 @@ class ModuleStatusWidget(QWidget):
 
     def _toggle(self, key: str) -> None:
         if key in self._busy:
+            self._paint()
             return
         if key == "fw_backend":
             asyncio.ensure_future(self._toggle_fw_backend())
@@ -301,12 +306,14 @@ class ModuleStatusWidget(QWidget):
         state = await self._engine.firewall_state(max_age=0)
         if not state.installed:
             self._show_error(self._state.t("fw_msg_missing"))
+            self._paint()           # the switch already flipped under the click
             return
         if state.running:
             # Turning the firewall off leaves the host exposed — never do it on
             # a single mis-click; make the consequence explicit first.
             if not self._confirm(self._state.t("fw_confirm_title"),
                                  self._state.t("fw_confirm_body")):
+                self._paint()
                 return
         self._verdicts.pop("fw_backend", None)
         self._busy.add("fw_backend")
@@ -407,10 +414,11 @@ class ModuleStatusWidget(QWidget):
                         status = s.t("status_unavailable")
                         detail = reason
 
-            row.status.setText(status)
-            row.status.setStyleSheet(
-                f"color: {'#00e676' if active else '#555555'}; font-size: 12px;"
-            )
+            unavailable = status == s.t("status_unavailable")
+            set_chip(row.status, status,
+                     THREAT_COLORS["safe"] if active
+                     else THREAT_COLORS["suspicious"] if unavailable
+                     else "#8b919a")
 
             # A verdict outranks the module's own description of itself: it was
             # checked against the system, and that is the whole point of it.
@@ -419,35 +427,39 @@ class ModuleStatusWidget(QWidget):
                 colour, label_key = _VERDICT_STYLE.get(
                     verdict.status, _VERDICT_STYLE[NA])
                 row.detail.setText(f"{s.t(label_key)} — {verdict.summary}")
-                row.detail.setStyleSheet(f"font-size: 11px; color: {colour};")
+                row.detail.setStyleSheet(f"color: {colour};")
                 row.detail.setToolTip("\n".join(verdict.evidence))
                 row.detail.setVisible(True)
             else:
-                row.detail.setText(detail)
-                row.detail.setStyleSheet("font-size: 11px; color: #777;")
+                # With nothing more specific to say, say what the module is for.
+                row.detail.setText(detail or s.t(f"desc_{key}"))
+                row.detail.setStyleSheet("")
                 row.detail.setToolTip("")
-                row.detail.setVisible(bool(detail))
-            row.btn.setText("●" if active else "○")
-            row.btn.setProperty("active", active)
-            _polish(row.btn)
+                row.detail.setVisible(True)
+            row.btn.set_busy(False)
+            row.btn.set_state(active)
 
     def _set_pending(self, key: str) -> None:
         row = self._rows.get(key)
         if row:
-            row.status.setText(self._state.t("status_working"))
-            row.status.setStyleSheet("color: #ffab00; font-size: 12px;")
+            set_chip(row.status, self._state.t("status_working"),
+                     THREAT_COLORS["suspicious"])
+            row.btn.set_busy(True)
 
     # ── messages ──────────────────────────────────────────────────────────
 
     def _show_error(self, text: str) -> None:
-        self._msg.setText("⚠  " + text)
-        self._msg.setStyleSheet(
-            "font-size: 12px; color: #ff3d00; padding: 6px 24px;")
+        self._show_banner("⚠  " + text, THREAT_COLORS["dangerous"])
 
     def _show_info(self, text: str) -> None:
+        self._show_banner(text, "")
+
+    def _show_banner(self, text: str, color: str) -> None:
+        self._msg.setVisible(bool(text))
         self._msg.setText(text)
-        self._msg.setStyleSheet(
-            "font-size: 12px; color: #888; padding: 6px 24px;")
+        tint = (f"color: {color}; border: 1px solid {color};" if color
+                else "border: 1px solid rgba(128,128,128,90);")
+        self._msg.setStyleSheet(f"{tint} border-radius: 8px; padding: 8px 12px;")
 
     def _confirm(self, title: str, body: str) -> bool:
         box = QMessageBox(self)
@@ -474,5 +486,7 @@ class ModuleStatusWidget(QWidget):
                 row.btn.setToolTip(self._state.t("tip_fw_backend"))
             elif key == "firewall":
                 row.btn.setToolTip(self._state.t("tip_fw_shield"))
-        self._msg.setText("")
+        for cat_key, lbl in self._cat_labels.items():
+            lbl.setText(self._state.t(cat_key).upper())
+        self._show_info("")
         self._paint()

@@ -8,8 +8,10 @@ class AppState(QObject):
 
     def __init__(self, theme: str = "dark", language: str = "en"):
         super().__init__()
-        self.theme = theme
-        self.language = language
+        # Anything unrecognised (a hand-edited or corrupt config) falls back
+        # to the defaults: English, dark.
+        self.theme = theme if theme in ("dark", "light") else "dark"
+        self.language = language if language in ("en", "tr") else "en"
 
     def set_theme(self, theme: str) -> None:
         if theme != self.theme:

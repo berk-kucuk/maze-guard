@@ -141,7 +141,8 @@ class TestIncidentIntegration(PostureTestCase):
                               autosave=False)
         return store, store.record(Event(
             type=EventType.ARP_SPOOF, level=ThreatLevel.DANGEROUS,
-            message="ARP spoof", data={"ip": ip, "mac": "de:ad:be:ef:00:01"}))
+            message="ARP spoof", data={"ip": "192.168.1.1", "src": ip,
+                                       "mac": "de:ad:be:ef:00:01"}))
 
     def test_dossier_captures_posture(self):
         self.write_status("maze-cloak", mac_randomised=True)

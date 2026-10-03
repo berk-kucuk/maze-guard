@@ -1,0 +1,66 @@
+[Unit]
+Description=Maze Guard privileged helper
+Documentation=file:///opt/maze-guard/README.md
+# Start once the network is configured: started earlier, the helper found no
+# usable interface and logged 'Device "eth0" does not exist' on every boot.
+Wants=network-online.target
+After=network-online.target firewalld.service
+
+[Service]
+# notify + watchdog: the helper says when it is ready, then pings from its
+# event loop. A helper that is running but wedged stops pinging and systemd
+# restarts it, instead of the GUI waiting on a socket nobody answers.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+# -I: isolated Python — no script directory on sys.path, no PYTHON* variables,
+# no user site-packages. Only the root-owned install can provide modules.
+ExecStart=@PYTHON@ -I @HELPER@
+Restart=on-failure
+RestartSec=2
+# The helper exits within a second of SIGTERM; anything longer is a wedge.
+TimeoutStopSec=10
+
+# /run/maze is SHARED with maze-tools' maze-guardd (guard.sock) and Maze
+# Sentinel, so it is NOT a RuntimeDirectory= (systemd would delete it, and
+# their sockets, whenever this unit stops). It is created here outside the
+# sandbox ('+') and the helper sets its group and mode itself.
+ExecStartPre=-+/usr/bin/mkdir -p /run/maze
+
+# ── Sandbox ────────────────────────────────────────────────────────────────
+# Read-only view of the whole filesystem except /run/maze. The helper writes
+# nothing else: firewall changes go to firewalld and unit changes to systemd
+# over D-Bus, and sysctl writes go to /proc/sys, which stays writable.
+ProtectSystem=strict
+ReadWritePaths=-/run/maze
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectHostname=true
+ProtectClock=true
+NoNewPrivileges=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+RemoveIPC=true
+UMask=0077
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Capabilities: only what the helper uses. NET_RAW — the packet capture;
+# NET_ADMIN — net.* sysctls; CHOWN/FOWNER — handing the socket to the maze
+# group; SYS_PTRACE + DAC_* — attributing other users' and root daemons'
+# connections from /proc/<pid>/fd; KILL — ending its own timed-out children.
+# Gone: reboot, mount/SYS_ADMIN, setuid/setgid, BPF, raw I/O, module loading.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_KILL
+# Bounds on what a misbehaving or abused helper can consume.
+MemoryMax=512M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

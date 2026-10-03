@@ -8,6 +8,7 @@ from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.core.verify import (FAIL, PASS, Verdict, WARN,
                               capture_feed, merge)
 from maze.utils.logger import log
+from maze.utils.ipaddr import AddressSet
 from maze.utils.network_info import link_epoch
 
 _GW_IP_RE  = re.compile(r'default via (\S+)')
@@ -111,10 +112,22 @@ def _get_own_ips(interface: str) -> set[str]:
     return own
 
 
+def _spoof_data(victim: str, old_mac: str, new_mac: str, attacker: str) -> dict:
+    """Event payload for an impersonation. "ip" stays the victim (what the UI
+    and blocking code have always read); the attacker is "src" + "mac", so the
+    dossier is filed under the impersonator — never under the router it
+    pretended to be."""
+    data = {"ip": victim, "victim": victim, "old_mac": old_mac,
+            "new_mac": new_mac, "mac": new_mac}
+    if attacker:
+        data["src"] = attacker
+    return data
+
+
 class ARPWatcher:
     def __init__(self, interface: str, whitelist: list[str] | None = None):
         self.interface = interface
-        self._whitelist = set(whitelist or [])  # user-configured, permanent
+        self._whitelist = AddressSet.of(whitelist)  # user-configured, permanent
         self._own_ips: set[str] = set()         # dynamic, refreshed every 60 s
         self.devices: dict[str, dict] = {}
         self._arp_table: dict[str, str] = {}   # kernel-confirmed MAC per host
@@ -327,11 +340,15 @@ class ARPWatcher:
                          < _OLD_MAC_ALIVE_WINDOW)
             is_gateway = bool(self._gw_ip) and ip == self._gw_ip
             if old_alive or is_gateway:
+                attacker = self._ip_of_mac(kmac, exclude=ip)
                 return Event(
                     type=EventType.ARP_SPOOF, level=ThreatLevel.DANGEROUS,
-                    message=f"ARP spoofing: {ip} changed MAC from "
-                            f"{prev} to {kmac} — possible MITM",
-                    data={"ip": ip, "old_mac": prev, "new_mac": kmac},
+                    message=f"ARP spoofing: {kmac}"
+                            + (f" ({attacker})" if attacker else "")
+                            + f" is impersonating {ip}"
+                            + (" — your gateway" if is_gateway else "")
+                            + f" (real MAC {prev}). Traffic may be intercepted",
+                    data=_spoof_data(ip, prev, kmac, attacker),
                 )
             return Event(
                 type=EventType.IP_MOVED, level=ThreatLevel.SUSPICIOUS,
@@ -339,6 +356,14 @@ class ARPWatcher:
                         f"a while) — most likely a reused DHCP lease",
                 data={"ip": ip, "old_mac": prev, "new_mac": kmac},
             )
+
+    def _ip_of_mac(self, mac: str, exclude: str) -> str:
+        """The impersonator's own address: another IP the same MAC answers
+        for. Caller holds the lock. "" when it has not been seen."""
+        for other, seen in self._arp_table.items():
+            if seen == mac and other != exclude:
+                return other
+        return ""
 
     async def _monitor_gateway(self) -> None:
         """Periodically verify default gateway IP and MAC — early MITM indicator.
@@ -401,12 +426,15 @@ class ARPWatcher:
                 self._gw_mac_pending = gw_mac
                 return
             self._gw_mac_pending = None
+            with self._lock:
+                attacker = self._ip_of_mac(gw_mac, exclude=gw_ip)
             await self._bus.emit(Event(
                 type=EventType.ARP_SPOOF,
                 level=ThreatLevel.DANGEROUS,
-                message=f"Gateway MAC changed: {self._gw_ip} "
-                        f"({self._gw_mac} → {gw_mac}) — possible MITM",
-                data={"ip": gw_ip, "old_mac": self._gw_mac, "new_mac": gw_mac},
+                message=f"Gateway MAC changed: {self._gw_ip} now answers as "
+                        f"{gw_mac}" + (f" ({attacker})" if attacker else "")
+                        + f", was {self._gw_mac} — possible MITM",
+                data=_spoof_data(gw_ip, self._gw_mac, gw_mac, attacker),
             ))
             self._gw_mac = gw_mac
         else:

@@ -11,7 +11,7 @@
 #   source=("$pkgname-$pkgver.tar.gz::https://github.com/berk-kucuk/maze-guard/archive/refs/tags/v$pkgver.tar.gz")
 
 pkgname=maze-guard
-pkgver=2.19.1
+pkgver=2.20.1
 pkgrel=1
 pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration"
 arch=('x86_64' 'aarch64')
@@ -77,62 +77,12 @@ LAUNCHER
     # Runs as root so the GUI never needs a sudo password. Access to its socket
     # (/run/maze/maze.sock) is gated by the 'maze' group.
     install -dm755 "$pkgdir/usr/lib/systemd/system"
-    install -m644 /dev/stdin "$pkgdir/usr/lib/systemd/system/maze-guard.service" << 'UNIT'
-[Unit]
-Description=Maze Guard privileged helper
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/opt/maze/venv/bin/python3 /opt/maze-guard/maze/helper.py
-Restart=on-failure
-RestartSec=2
-# The helper exits within a second of SIGTERM; anything longer is a wedge
-# (a torn-down environment under a running process, a stuck sniff thread) and
-# not worth systemd's 90 s default — it stalls every shutdown and upgrade.
-TimeoutStopSec=10
-# NO RuntimeDirectory=maze here. /run/maze is SHARED: maze-tools' maze-guardd
-# binds /run/maze/guard.sock in it, and Maze Sentinel writes state files there.
-# RuntimeDirectory makes systemd DELETE the whole directory when this unit stops,
-# so every restart of this helper — a package upgrade is enough — wiped guard.sock
-# out from under a still-running maze-guardd. Maze Connect's killswitch view then
-# hung on "Reading killswitches…" forever, because the socket it dials had
-# silently ceased to exist while the daemon owning it still thought it was
-# listening. maze-tools' own unit carries the same warning. The helper creates and
-# permissions the directory itself in _ensure_sock_dir(), so nothing is lost.
-# Conservative hardening: ProtectSystem stays 'true' (not 'strict') so firewalld
-# can write /etc/firewalld; kernel-tunable and address-family locks are omitted
-# because the helper writes sysctl and sniffs via AF_PACKET.
-ProtectHome=true
-ProtectControlGroups=true
-ProtectKernelLogs=true
-ProtectSystem=true
-ProtectHostname=true
-NoNewPrivileges=true
-RestrictSUIDSGID=true
-LockPersonality=true
-# Sandbox (2026-09). Everything below leaves what the helper really does intact
-# — sniffing (AF_PACKET), sysctl writes (so no ProtectKernelTunables), firewalld
-# and systemd over D-Bus, polkit — and takes away what it never needs: loading
-# kernel modules, the clock, realtime scheduling, new namespaces, foreign-ABI
-# syscalls, raw devices, and every syscall outside the normal service set
-# (answered with EPERM, not a kill, so a surprise shows up as an error in the
-# journal instead of a dead helper). Verify on a machine: sudo maze-sandbox-check
-# Relax one directive locally if ever needed: sudo systemctl edit maze-guard
-PrivateTmp=true
-PrivateDevices=true
-ProtectClock=true
-ProtectKernelModules=true
-RestrictRealtime=true
-RestrictNamespaces=true
-SystemCallArchitectures=native
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
-
-[Install]
-WantedBy=multi-user.target
-UNIT
+    # One unit definition, shared with install.sh: packaging/maze-guard.service.
+    _unit="maze-guard.service"
+    [[ -f "$_unit" ]] || _unit="packaging/maze-guard.service"
+    sed -e 's|@PYTHON@|/opt/maze/venv/bin/python3|' \
+        -e 's|@HELPER@|/opt/maze-guard/maze/helper.py|' "$_unit" \
+        | install -m644 /dev/stdin "$pkgdir/usr/lib/systemd/system/maze-guard.service"
 
     # ── polkit: consent for turning protections off ────────────────────────
     # Without this action registered, the helper refuses every destructive

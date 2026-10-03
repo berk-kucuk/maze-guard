@@ -33,4 +33,24 @@
       <allow_active>auth_admin_keep</allow_active>
     </defaults>
   </action>
+
+  <!--
+    Blocking is "adding protection" and normally needs no prompt. Two kinds of
+    block are not protection, though: a whole address range, or this machine's
+    own gateway / DNS server — either takes the machine off its network. Maze
+    Guard never does either on its own, so only a person (who can answer) or
+    something abusing the helper socket (which cannot) asks for them.
+  -->
+  <action id="org.mazeguard.block-network">
+    <description>Block a network range or this machine's gateway</description>
+    <description xml:lang="tr">Bir ağ aralığını veya bu makinenin ağ geçidini engelle</description>
+    <message>Authentication is required to block a whole address range or this machine's own gateway or DNS server, which can cut this computer off its network.</message>
+    <message xml:lang="tr">Bütün bir adres aralığını ya da bu makinenin ağ geçidini veya DNS sunucusunu engellemek için kimlik doğrulaması gerekiyor; bu, bilgisayarın ağ bağlantısını kesebilir.</message>
+    <icon_name>security-high</icon_name>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+  </action>
 </policyconfig>

@@ -5,6 +5,8 @@ import struct
 from dataclasses import dataclass
 from maze.core.events import Event, EventBus, EventType, ThreatLevel
 from maze.core.verify import FAIL, PASS, Verdict, WARN
+from maze.utils.ipaddr import AddressSet
+from maze.utils.logger import log
 
 _SEEN_MAX = 2000   # prune seen-set when it exceeds this size
 
@@ -153,10 +155,11 @@ class ProcessNetworkMonitor:
     def __init__(self, known_processes: set[str] | None = None,
                  whitelist: list[str] | None = None):
         self._known = known_processes or set()
-        self._whitelist = set(whitelist or [])
+        self._whitelist = AddressSet.of(whitelist)
         self._bus: EventBus | None = None
         self._task: asyncio.Task | None = None
         self._helper = None
+        self._seen_keys: dict[tuple, None] = {}
 
     async def start(self, bus: EventBus, helper=None) -> None:
         self._bus = bus
@@ -293,28 +296,44 @@ class ProcessNetworkMonitor:
         # and the service it talks to, not the address: a browser or an
         # updater talking to a CDN reaches a different IP almost every time,
         # and one row per IP was a stream of identical alerts.
-        seen: dict[tuple, None] = {}
+        self._seen_keys.clear()
         while True:
             await asyncio.sleep(10)
-            conns = await self.snapshot()
-            for conn in conns:
-                if conn.remote_ip in self._whitelist:
+            try:
+                await self.check(await self.snapshot())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # One failed snapshot (the helper restarting, a process gone
+                # mid-read) used to end this task for good while the module
+                # kept reporting itself active.
+                log.warning(f"process monitor: scan failed, retrying — {exc}")
+
+    async def check(self, conns: list[Connection]) -> int:
+        """Report connections by programs that are not trusted. Returns how
+        many new reports were raised."""
+        seen = self._seen_keys
+        raised = 0
+        for conn in conns:
+            if conn.remote_ip in self._whitelist:
+                continue
+            if self._known and not self._is_known(conn):
+                if conn.remote_port in self._NORMAL_PORTS:
                     continue
-                if self._known and not self._is_known(conn):
-                    if conn.remote_port in self._NORMAL_PORTS:
-                        continue
-                    key = (conn.process, conn.remote_port)
-                    if key in seen:
-                        continue
-                    seen[key] = None
-                    await self._bus.emit(Event(
-                        type=EventType.UNKNOWN_PROCESS,
-                        level=ThreatLevel.SUSPICIOUS,
-                        message=f"Unknown process connected externally: "
-                                f"{conn.process} (PID {conn.pid}) → {conn.remote_addr}",
-                        data={"process": conn.process, "pid": conn.pid,
-                              "remote": conn.remote_addr},
-                    ))
-            if len(seen) > _SEEN_MAX:
-                for old in list(seen)[:len(seen) - _SEEN_MAX // 2]:
-                    del seen[old]
+                key = (conn.process, conn.remote_port)
+                if key in seen:
+                    continue
+                seen[key] = None
+                raised += 1
+                await self._bus.emit(Event(
+                    type=EventType.UNKNOWN_PROCESS,
+                    level=ThreatLevel.SUSPICIOUS,
+                    message=f"Unknown process connected externally: "
+                            f"{conn.process} (PID {conn.pid}) → {conn.remote_addr}",
+                    data={"process": conn.process, "pid": conn.pid,
+                          "remote": conn.remote_addr},
+                ))
+        if len(seen) > _SEEN_MAX:
+            for old in list(seen)[:len(seen) - _SEEN_MAX // 2]:
+                del seen[old]
+        return raised
