@@ -6,6 +6,8 @@
 
 **Public WiFi Security Monitor**
 
+*Developed for [Maze Linux](https://github.com/berk-kucuk/MazeLinux)*
+
 *MITM detection · firewalld integration · Packet analysis*
 
 ---
@@ -461,6 +463,8 @@ packaging/
 ---
 
 ## License
+
+Copyright © 2026 Berk Küçük
 
 GPL3 — see [LICENSE](LICENSE).
 

@@ -816,7 +816,7 @@ STRINGS: dict[str, dict[str, str]] = {
 
 # ── Interface redesign (sidebar layout, overview, settings) ──────────────────
 STRINGS["en"].update({
-    "app_tagline": "Network defence",
+    "app_tagline": "for Maze Linux",
     "tip_reset_threat": "Reset the threat level",
     "tip_minimize": "Minimise",
     "tip_maximize": "Maximise / restore",
@@ -999,7 +999,7 @@ STRINGS["en"].update({
 })
 
 STRINGS["tr"].update({
-    "app_tagline": "Ağ savunması",
+    "app_tagline": "Maze Linux için",
     "tip_reset_threat": "Tehdit seviyesini sıfırla",
     "tip_minimize": "Simge durumuna küçült",
     "tip_maximize": "Büyüt / geri yükle",

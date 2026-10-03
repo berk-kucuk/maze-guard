@@ -11,9 +11,9 @@
 #   source=("$pkgname-$pkgver.tar.gz::https://github.com/berk-kucuk/maze-guard/archive/refs/tags/v$pkgver.tar.gz")
 
 pkgname=maze-guard
-pkgver=2.20.1
+pkgver=2.20.2
 pkgrel=1
-pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration"
+pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration — for Maze Linux"
 arch=('x86_64' 'aarch64')
 url="https://github.com/berk-kucuk/maze-guard"
 license=('MIT')
@@ -110,7 +110,7 @@ Version=1.1
 Type=Application
 Name=Maze Guard
 GenericName=Network Security Monitor
-Comment=Public WiFi protection — MITM detection, firewall
+Comment=Public WiFi protection — MITM detection, firewall — for Maze Linux
 Exec=/usr/bin/maze-guard
 Icon=maze-guard
 Terminal=false
