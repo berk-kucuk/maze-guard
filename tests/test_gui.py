@@ -355,7 +355,11 @@ class DetectionToBlockTests(GuiTestBase):
         async def fake_recon(ip, *a, **k):
             return ReconResult(ip=ip, mac="aa:bb:cc:11:22:33")
 
+        async def verified(_self, ip, frame_macs):
+            return "aa:bb:cc:11:22:33"   # the scan frames came from the address's owner
+
         with unittest.mock.patch("maze.utils.recon.recon_ip", fake_recon), \
+             unittest.mock.patch.object(type(self.engine), "_verified_source_mac", verified), \
              unittest.mock.patch.object(type(self.engine), "_infra_ips",
                                         lambda _self: set()):
             async def scan():
@@ -421,6 +425,10 @@ class NotificationTests(GuiTestBase):
                                                         ReconResult(ip=ip))),
             unittest.mock.patch.object(type(self.engine), "_infra_ips",
                                        lambda _self: set()),
+            # Scan sources in these tests count as verified owners of their
+            # address (the real check reads the kernel ARP table).
+            unittest.mock.patch.object(type(self.engine), "_verified_source_mac",
+                                       unittest.mock.AsyncMock(return_value="02:00:00:00:00:66")),
         ]
         for p in self._extra:
             p.start()

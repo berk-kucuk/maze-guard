@@ -20,6 +20,11 @@ _ACTIVE_ATTACK = {
 # Re-run recon against a known source only after this long, so a sustained
 # attack does not queue one scan per alert.
 _RECON_TTL = 900.0
+# Auto-blocks allowed per window before the engine stops and only reports.
+# Each one is a --permanent rule that takes polkit consent to remove, so a
+# flood of forged scans must not be able to wall off the whole LAN.
+_AUTO_BLOCK_LIMIT = 5
+_AUTO_BLOCK_WINDOW = 3600.0
 
 # How often the kernel log is read back for drop-rule hits, and how far the
 # first read reaches back to pick up blocks installed before this session.
@@ -47,6 +52,7 @@ class MazeEngine:
         self._errors: dict[str, str] = {}
         self._running = False
         self._recon_at: dict[str, float] = {}
+        self._auto_blocks: list[float] = []
         self._block_log_at: datetime | None = None
         self._fw_state_at = 0.0
         # One whitelist, shared by reference with every detector, so an entry
@@ -620,7 +626,73 @@ class MazeEngine:
             ips |= _get_resolved_upstreams()
         except Exception:
             pass
+        # The DHCP server this machine actually got its lease from (often not
+        # the gateway on bigger networks). Blocking it breaks the next renewal.
+        ips |= self._dhcp_servers()
         return ips
+
+    def _dhcp_servers(self) -> set[str]:
+        """DHCP server identifiers from NetworkManager's active lease."""
+        import subprocess
+        out: set[str] = set()
+        try:
+            res = subprocess.run(
+                ["nmcli", "-g", "DHCP4.OPTION", "device", "show", str(self.cfg.interface)],
+                capture_output=True, text=True, timeout=5)
+            for line in (res.stdout or "").replace("|", "\n").splitlines():
+                key, _, val = line.partition("=")
+                if key.strip() == "dhcp_server_identifier" and val.strip():
+                    out.add(val.strip())
+        except Exception:
+            pass
+        return out
+
+    @staticmethod
+    def _arp_mac(ip: str) -> str:
+        """The kernel's complete ARP entry for ``ip`` (lower-case), or ""."""
+        from pathlib import Path
+        try:
+            for line in Path("/proc/net/arp").read_text().splitlines()[1:]:
+                f = line.split()
+                # flags 0x2 = complete; 00:00:… = incomplete placeholder
+                if len(f) >= 4 and f[0] == ip and f[2] != "0x0" \
+                        and f[3] != "00:00:00:00:00:00":
+                    return f[3].lower()
+        except Exception:
+            pass
+        return ""
+
+    async def _verified_source_mac(self, ip: str, frame_macs: list[str]) -> str | None:
+        """Hardware address of a scan source, or None when the source cannot
+        be shown to be real.
+
+        A scan's IP source address is whatever the sender wrote into it, so on
+        its own it named a victim, not an attacker: three forged NULL packets
+        "from" the NAS got the NAS firewalled. Before acting we require the
+        kernel's ARP entry for that address (resolved by us, now) to name the
+        same machine the scan frames actually came from. A forged source with
+        the attacker's own MAC fails this; a frame MAC we never saw (old
+        helper) is accepted only if the address resolves at all.
+        """
+        import socket
+        mac = self._arp_mac(ip)
+        if not mac:
+            # Make the kernel resolve it: any datagram to the address does.
+            def _poke():
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                        s.sendto(b"", (ip, 9))
+                except OSError:
+                    pass
+            await asyncio.to_thread(_poke)
+            await asyncio.sleep(1.0)
+            mac = self._arp_mac(ip)
+        if not mac:
+            return None
+        macs = {m.lower() for m in frame_macs if m}
+        if macs and mac not in macs:
+            return None
+        return mac
 
     async def _on_event_for_recon(self, event) -> None:
         """Single subscriber that files every event and decides on a response."""
@@ -654,8 +726,10 @@ class MazeEngine:
             return
         self._recon_at[ip] = now
         auto_block = bool(getattr(self.cfg, "auto_block", True))
+        frame_macs = list(event.data.get("macs") or [])
         asyncio.create_task(self._do_recon(ip, auto_block=auto_block,
-                                           trigger=event.type.value))
+                                           trigger=event.type.value,
+                                           frame_macs=frame_macs))
 
     async def rescan(self, ip: str) -> None:
         """Re-run recon on demand (Threats tab), bypassing the cooldown."""
@@ -663,7 +737,7 @@ class MazeEngine:
         await self._do_recon(ip, auto_block=False)
 
     async def _do_recon(self, ip: str, auto_block: bool = False,
-                        trigger: str = "") -> None:
+                        trigger: str = "", frame_macs: list[str] | None = None) -> None:
         from maze.utils.recon import recon_ip, format_recon
         from maze.protection.dns_leak import _is_private_ip
 
@@ -686,7 +760,37 @@ class MazeEngine:
         # it the other way round meant a confirmed attacker kept scanning for
         # the whole duration of our sweep of them.
         if auto_block:
-            await self._block_attacker(ip, trigger)
+            verified = await self._verified_source_mac(ip, frame_macs or [])
+            if verified is None:
+                # Not shown to be real: likely a forged source naming an
+                # innocent host. Neither block it nor sweep it.
+                log.warning(f"auto-block/recon skipped for {ip}: the scan frames "
+                            f"did not come from the host that owns this address "
+                            f"(spoofed source?)")
+                try:
+                    self.incidents.add_action(
+                        ip, "not blocked: source address could not be verified "
+                            "(possible spoofing)")
+                except Exception:
+                    pass
+                return
+            now = time.monotonic()
+            self._auto_blocks = [t for t in self._auto_blocks
+                                 if now - t < _AUTO_BLOCK_WINDOW]
+            if len(self._auto_blocks) >= _AUTO_BLOCK_LIMIT:
+                log.warning(f"auto-block limit reached ({_AUTO_BLOCK_LIMIT}/h); "
+                            f"not blocking {ip} — review the Threats tab")
+                await self.bus.emit(Event(
+                    type=EventType.IP_BLOCKED,
+                    level=ThreatLevel.SUSPICIOUS,
+                    message=(f"Not auto-blocking {ip}: {_AUTO_BLOCK_LIMIT} automatic "
+                             f"blocks already this hour. Block it from the Threats "
+                             f"tab if it is real."),
+                    data={"ip": ip, "trigger": trigger, "skipped": "rate-limit"},
+                ))
+            else:
+                self._auto_blocks.append(now)
+                await self._block_attacker(ip, trigger, mac=verified)
 
         try:
             result = await recon_ip(ip)
@@ -730,13 +834,13 @@ class MazeEngine:
             },
         ))
 
-    async def _block_attacker(self, ip: str, trigger: str) -> None:
+    async def _block_attacker(self, ip: str, trigger: str, mac: str = "") -> None:
         """Drop a confirmed attacker immediately, and say why.
 
         Identity here is only what the dossier already knows (ARP, earlier
         events); the recon that follows enriches it through RECON_RESULT.
         """
-        if not await self.block_ip(ip):
+        if not await self.block_ip(ip, mac=mac):
             log.warning(f"auto-block of {ip} failed: {self.firewall_error()}")
             return
         att = self.incidents.get(ip)
@@ -769,7 +873,7 @@ class MazeEngine:
             fw._helper = self.helper
         return fw
 
-    async def block_ip(self, ip: str) -> bool:
+    async def block_ip(self, ip: str, mac: str = "") -> bool:
         """Drop a source address, and its hardware address where we know it.
 
         An address block alone is porous by design: the host renews its DHCP
@@ -787,7 +891,7 @@ class MazeEngine:
                 pm.mark_blocked(ip)
             self.incidents.mark_blocked(ip, True)
             if getattr(self.cfg, "block_by_mac", True):
-                await self._block_mac_for(ip)
+                await self._block_mac_for(ip, mac=mac)
         return ok
 
     async def unblock_ip(self, ip: str) -> bool:
@@ -824,9 +928,12 @@ class MazeEngine:
         fw = self._fw()
         return await fw.unblock_mac(mac) if fw else False
 
-    async def _block_mac_for(self, ip: str) -> bool:
+    async def _block_mac_for(self, ip: str, mac: str = "") -> bool:
+        """Block the hardware address behind ``ip``. An explicit ``mac`` (one
+        verified against the kernel ARP table) wins over the remembered one,
+        which may have been learned from an unauthenticated ARP packet."""
         fw = self._fw()
-        mac = self.mac_for(ip)
+        mac = mac or self.mac_for(ip)
         if not (fw and mac):
             return False
         if not await fw.block_mac(mac):

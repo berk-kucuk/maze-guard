@@ -114,10 +114,15 @@ class BlockOrderingTests(EngineTestBase):
     """
 
     @contextmanager
-    def _patched(self, order, infra=()):
-        async def fake_block(_engine, ip):
+    def _patched(self, order, infra=(), verified="02:00:00:00:00:50"):
+        async def fake_block(_engine, ip, mac=""):
             order.append("block")
             return True
+
+        async def fake_verify(_engine, ip, frame_macs):
+            # The kernel-ARP check is environment-dependent; tests decide
+            # whether the scan source proves to be the address's real owner.
+            return verified
 
         async def fake_recon(ip, **kw):
             order.append("recon")
@@ -125,6 +130,7 @@ class BlockOrderingTests(EngineTestBase):
             return ReconResult(ip=ip)
 
         with unittest.mock.patch.object(type(self.engine), "block_ip", fake_block), \
+             unittest.mock.patch.object(type(self.engine), "_verified_source_mac", fake_verify), \
              unittest.mock.patch("maze.utils.recon.recon_ip", fake_recon), \
              unittest.mock.patch.object(type(self.engine), "_infra_ips",
                                         lambda _engine: set(infra)):
@@ -154,6 +160,31 @@ class BlockOrderingTests(EngineTestBase):
             run(self.engine._do_recon("8.8.8.8", auto_block=True,
                                       trigger="port_scan"))
         self.assertEqual(order, [])
+
+    def test_a_spoofed_source_is_neither_blocked_nor_scanned(self):
+        """Forged scan packets naming another LAN host as their source must
+        not get that host firewalled (or swept): the frames did not come from
+        the machine that owns the address."""
+        order: list[str] = []
+        with self._patched(order, verified=None):
+            run(self.engine._do_recon("192.168.1.50", auto_block=True,
+                                      trigger="stealth_scan"))
+        self.assertEqual(order, [])
+        self.assertEqual(self._of_type(EventType.IP_BLOCKED), [])
+
+    def test_auto_blocks_are_rate_limited(self):
+        """A flood of (even verified) scan sources cannot wall off the LAN:
+        past the hourly limit the engine reports instead of blocking."""
+        from maze.core.engine import _AUTO_BLOCK_LIMIT
+        order: list[str] = []
+        with self._patched(order):
+            for i in range(_AUTO_BLOCK_LIMIT + 2):
+                run(self.engine._do_recon(f"192.168.1.{60 + i}", auto_block=True,
+                                          trigger="port_scan"))
+        self.assertEqual(order.count("block"), _AUTO_BLOCK_LIMIT)
+        skipped = [e for e in self._of_type(EventType.IP_BLOCKED)
+                   if e.data.get("skipped") == "rate-limit"]
+        self.assertEqual(len(skipped), 2)
 
     def test_infrastructure_is_never_blocked(self):
         order: list[str] = []

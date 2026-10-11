@@ -44,6 +44,13 @@ _RA_LEARN_WINDOW = 30.0
 
 # A source must stay quiet this long before the same anomaly is reported again.
 _COOLDOWN = 600.0
+# Bounds on per-source state. Every key here comes from a sniffed field an
+# on-link attacker chooses freely (ARP psrc/hwsrc/pdst, ICMP src/dst); without
+# a ceiling a stream of forged identities grew these tables until the network
+# changed. A home or café LAN has nowhere near this many real senders.
+_MAX_SOURCES = 2048
+_MAX_WINDOW_ITEMS = 1024
+_MAX_ALERT_KEYS = 4096
 
 # Two different hostile detections about one source inside this window are
 # treated as one campaign.
@@ -74,7 +81,10 @@ class _Window:
             self.started = now
             self.items.clear()
             self.packets = 0
-        self.items.add(item)
+        # Every threshold is far below this; past it the count stops growing
+        # but the source is already well over any alert limit.
+        if len(self.items) < _MAX_WINDOW_ITEMS:
+            self.items.add(item)
         self.packets += 1
 
 
@@ -273,7 +283,7 @@ class AnomalyDetector:
         if int(msg.get("op", 2)) == 2 and mac and src != self._gw_ip \
                 and mac.lower() != self._gw_mac.lower():
             now = time.monotonic()
-            win = self._mac_claims.setdefault(mac, _Window(started=now))
+            win = self._window_for(self._mac_claims, mac, now, _MAC_CLAIM_WINDOW)
             win.add(src, now, _MAC_CLAIM_WINDOW)
             claims = win.items
             if len(claims) >= _MAC_CLAIM_LIMIT and self._may_alert(("macclaim", mac)):
@@ -295,7 +305,7 @@ class AnomalyDetector:
         if not target:
             return
         now = time.monotonic()
-        win = self._arp_probes.setdefault(src, _Window(started=now))
+        win = self._window_for(self._arp_probes, src, now, _DISCOVERY_WINDOW)
         win.add(target, now, _DISCOVERY_WINDOW)
         if len(win.items) >= _ARP_SCAN_HOSTS and self._may_alert(("arpscan", src)):
             await self._emit(Event(
@@ -329,7 +339,7 @@ class AnomalyDetector:
         if not dst:
             return
         now = time.monotonic()
-        win = self._icmp_probes.setdefault(src, _Window(started=now))
+        win = self._window_for(self._icmp_probes, src, now, _DISCOVERY_WINDOW)
         win.add(dst, now, _DISCOVERY_WINDOW)
         if len(win.items) >= _ICMP_SWEEP_HOSTS and self._may_alert(("ping", src)):
             await self._emit(Event(
@@ -450,10 +460,33 @@ class AnomalyDetector:
 
     # ── helpers ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _window_for(table: dict, key: str, now: float, window: float) -> "_Window":
+        """``table[key]``, creating it — but never growing ``table`` past
+        _MAX_SOURCES. Expired windows go first, then the oldest."""
+        win = table.get(key)
+        if win is not None:
+            return win
+        if len(table) >= _MAX_SOURCES:
+            for k in [k for k, w in table.items() if now - w.started > window]:
+                del table[k]
+            while len(table) >= _MAX_SOURCES:
+                oldest = min(table, key=lambda k: table[k].started)
+                del table[oldest]
+        win = table[key] = _Window(started=now)
+        return win
+
     def _may_alert(self, key: tuple) -> bool:
         now = time.monotonic()
         if now - self._last_alert.get(key, 0.0) < _COOLDOWN:
             return False
+        if len(self._last_alert) >= _MAX_ALERT_KEYS:
+            for k in [k for k, t in self._last_alert.items() if now - t >= _COOLDOWN]:
+                del self._last_alert[k]
+            if len(self._last_alert) >= _MAX_ALERT_KEYS:
+                # Still full of live cooldowns: drop the oldest half.
+                for k in sorted(self._last_alert, key=self._last_alert.get)[:_MAX_ALERT_KEYS // 2]:
+                    del self._last_alert[k]
         self._last_alert[key] = now
         return True
 

@@ -329,8 +329,11 @@ def _block_needs_consent(kind: str, value: str) -> str:
             except ValueError:
                 continue
     elif kind == "mac":
-        if value in _gateway_macs(_default_gateways()):
-            return "block this machine's gateway"
+        # Gateway AND resolver hardware addresses: an auto-block fooled into
+        # naming a local DNS server (Pi-hole, router-as-resolver) would cut the
+        # machine off just as surely as blocking the gateway.
+        if value in _gateway_macs(_default_gateways() | _nameservers()):
+            return "block this machine's gateway or DNS server"
     return ""
 
 
@@ -631,7 +634,7 @@ def _tcp_flag_str(flags) -> str:
 
 def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int,
                 should_stop=None) -> None:
-    from scapy.all import ARP, DHCP, ICMP, IP, IPv6, TCP, UDP, sniff
+    from scapy.all import ARP, DHCP, ICMP, IP, IPv6, TCP, UDP, Ether, sniff
 
     own_ips: set[str] = _get_iface_ips(iface)
     own_ips_refreshed_at: float = time.monotonic()
@@ -685,10 +688,14 @@ def _sniff_once(iface: str, limiter: "_PushLimiter", stop_after: int,
             if not limiter.allow():
                 return
             tcp = pkt[TCP]
+            # smac: the frame's sender. The IP source is whatever the sender
+            # wrote; the engine compares this against the kernel's ARP entry
+            # for that IP before it will auto-block anything.
             _push({"event": "tcp", "src": src, "dst": dst,
                    "sport": int(tcp.sport), "dport": int(tcp.dport),
                    "flags": _tcp_flag_str(tcp.flags), "ttl": int(pkt[IP].ttl),
-                   "win": int(tcp.window)})
+                   "win": int(tcp.window),
+                   "smac": pkt[Ether].src.lower() if pkt.haslayer(Ether) else ""})
         elif pkt.haslayer(ICMP):
             if not limiter.allow():
                 return

@@ -52,6 +52,9 @@ class ScanRecord:
     alerted_at: float = 0.0
     escalated_at: float = 0.0
     stealth_alerted_at: float = 0.0
+    # Ethernet senders seen carrying this source address (bounded). The engine
+    # checks them against the kernel ARP entry before an auto-block.
+    macs: set = field(default_factory=set)
 
     @property
     def duration(self) -> float:
@@ -77,6 +80,7 @@ class ScanRecord:
             "stealth_packets": self.stealth_packets,
             "duration_s": round(self.duration, 1),
             "rate_pps": round(self.rate, 2),
+            "macs": sorted(self.macs),
         }
 
 
@@ -247,7 +251,8 @@ class PortScanDetector:
         kind = msg.get("event")
         if kind == "tcp":
             await self._process(msg.get("src"), msg.get("dport", 0),
-                                msg.get("flags", "S"), msg.get("dst", ""))
+                                msg.get("flags", "S"), msg.get("dst", ""),
+                                str(msg.get("smac", "") or ""))
         elif kind == "syn":     # older helper daemon
             await self._process(msg.get("src"), msg.get("dport", 0), "S",
                                 msg.get("dst", ""))
@@ -283,8 +288,9 @@ class PortScanDetector:
                 src, dst = pkt[IPv6].src, pkt[IPv6].dst
             else:
                 return
+            smac = str(getattr(pkt, "src", "") or "").lower() if pkt.haslayer("Ether") else ""
             asyncio.run_coroutine_threadsafe(
-                self._process(src, pkt[TCP].dport, str(pkt[TCP].flags), dst),
+                self._process(src, pkt[TCP].dport, str(pkt[TCP].flags), dst, smac),
                 self._loop)
 
         loop = asyncio.get_event_loop()
@@ -308,7 +314,7 @@ class PortScanDetector:
     # ── analysis ──────────────────────────────────────────────────────────
 
     async def _process(self, src: str | None, dport: int = 0,
-                       flags: str = "S", dst: str = "") -> None:
+                       flags: str = "S", dst: str = "", smac: str = "") -> None:
         if not src:
             return
         if src in self._whitelist or src in self._own_ips:
@@ -351,6 +357,8 @@ class PortScanDetector:
             rec.targets.add(dst)
         if len(rec.ports) < _MAX_PORTS_TRACKED:
             rec.ports.add(int(dport or 0))
+        if smac and len(rec.macs) < 8:
+            rec.macs.add(smac)
 
         if technique:
             rec.techniques.add(technique)

@@ -28,6 +28,9 @@ _KERNEL_CHECK_COOLDOWN = 5.0
 # minutes by then. Real ARP poisoning is the opposite: the legitimate host is
 # still there, still answering, and two MACs fight over one IP within seconds.
 _OLD_MAC_ALIVE_WINDOW = 60.0
+# Hosts tracked at once. Each new ARP sender (address and MAC chosen freely by
+# whoever sends the packet) used to add a permanent entry to three tables.
+_MAX_HOSTS = 2048
 
 
 def _kernel_mac(ip: str) -> str | None:
@@ -249,7 +252,7 @@ class ARPWatcher:
         # reused lease (see _evaluate). This path never recorded it, so every
         # spoof seen through the helper was downgraded to "lease moved".
         with self._lock:
-            self._mac_seen[mac] = time.monotonic()
+            self._note_mac(mac)
         # _evaluate may shell out to `ip neigh`; keep it off the event loop.
         event = await asyncio.to_thread(self._evaluate, ip, mac)
         if event:
@@ -277,10 +280,41 @@ class ARPWatcher:
         if ip in self._whitelist or ip in self._own_ips:
             return
         with self._lock:
-            self._mac_seen[mac] = time.monotonic()
+            self._note_mac(mac)
         event = self._evaluate(ip, mac)
         if event:
             asyncio.run_coroutine_threadsafe(self._bus.emit(event), self._loop)
+
+    def _note_mac(self, mac: str) -> None:
+        """Record that ``mac`` was heard now (caller holds ``_lock``), bounded."""
+        self._mac_seen[mac] = time.monotonic()
+        if len(self._mac_seen) > _MAX_HOSTS * 2:
+            now = time.monotonic()
+            for m in [m for m, t in self._mac_seen.items()
+                      if now - t > _OLD_MAC_ALIVE_WINDOW]:
+                del self._mac_seen[m]
+            while len(self._mac_seen) > _MAX_HOSTS * 2:
+                del self._mac_seen[min(self._mac_seen, key=self._mac_seen.get)]
+
+    def _make_room(self) -> None:
+        """Keep the per-host tables bounded (caller holds ``_lock``).
+
+        The oldest-discovered host goes first (dict order is insertion
+        order); the gateway is never evicted, it is what spoofing protects."""
+        while len(self.devices) >= _MAX_HOSTS:
+            victim = next((ip for ip in self.devices if ip != self._gw_ip), None)
+            if victim is None:
+                break
+            self.devices.pop(victim, None)
+            self._arp_table.pop(victim, None)
+            self._last_check.pop(victim, None)
+        if len(self._mac_seen) >= _MAX_HOSTS * 2:
+            now = time.monotonic()
+            for m in [m for m, t in self._mac_seen.items()
+                      if now - t > _OLD_MAC_ALIVE_WINDOW]:
+                del self._mac_seen[m]
+            while len(self._mac_seen) >= _MAX_HOSTS * 2:
+                del self._mac_seen[min(self._mac_seen, key=self._mac_seen.get)]
 
     def _evaluate(self, ip: str, mac: str) -> Event | None:
         """Turn one sniffed ARP reply (ip is-at mac) into an Event, or None.
@@ -293,6 +327,7 @@ class ARPWatcher:
         """
         with self._lock:
             if ip not in self.devices:
+                self._make_room()
                 self.devices[ip] = {"mac": mac, "first_seen": datetime.now()}
                 self._arp_table[ip] = mac
                 return Event(
