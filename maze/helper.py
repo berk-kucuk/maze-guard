@@ -34,7 +34,7 @@ _FWC_SAFE_FLAGS = {
     "--get-default-zone",
     # Zone-target modification: used by incoming-block toggle to drop
     # uninvited traffic while still honouring allowed services in the zone
-    # (e.g. kdeconnect). Only these two values are permitted.
+    # (e.g. maze-connect). Only these two values are permitted.
     "--set-target=DROP", "--set-target=default",
 }
 # NOT allowed, deliberately: --set-default-zone. Maze Guard never sets the

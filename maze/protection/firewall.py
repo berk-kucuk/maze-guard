@@ -363,7 +363,7 @@ class FirewallManager:
             return False
         # Set the zone's default target to DROP instead of switching zones.
         # This blocks unsolicited inbound traffic while preserving explicitly
-        # allowed services in the zone (e.g. kdeconnect, ssh) that would be
+        # allowed services in the zone (e.g. maze-connect, ssh) that would be
         # silently ignored if we switched to the "drop" zone.
         ok = await self._fw_cmd(["--permanent", "--zone", self._zone,
                                  "--set-target=DROP"])

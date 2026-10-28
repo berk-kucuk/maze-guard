@@ -154,10 +154,10 @@ pre_remove() {
 
 post_remove() {
     systemctl daemon-reload 2>/dev/null || true
-    # Only OUR socket. /run/maze is shared: maze-tools' maze-guardd listens on
-    # /run/maze/guard.sock there and Maze Sentinel keeps state in it — the same
+    # Only OUR socket. /run/maze is shared: maze-tools' maze-switchd listens on
+    # /run/maze/switch.sock there and Maze Sentinel keeps state in it — the same
     # reason the unit carries no RuntimeDirectory=. Wiping the directory killed
-    # the panic button / kill switches under a still-running maze-guardd.
+    # the panic button / kill switches under a still-running maze-switchd.
     rm -f /run/maze/maze.sock 2>/dev/null || true
     rmdir /run/maze 2>/dev/null || true             # only if nothing else is left
     rm -rf "$_INSTALL_DIR/venv" 2>/dev/null || true   # pre-maze-python leftovers

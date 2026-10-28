@@ -50,7 +50,7 @@ uninstall() {
   remove_legacy
   systemctl daemon-reload
   rm -rf "$DEST"
-  # Only our own socket: /run/maze is shared with maze-guardd and Maze Sentinel.
+  # Only our own socket: /run/maze is shared with maze-switchd and Maze Sentinel.
   rm -f /run/maze/maze.sock
   ok "Daemon removed. (The '$GROUP' group and the polkit policy were left in place.)"
   exit 0

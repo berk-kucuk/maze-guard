@@ -21,7 +21,7 @@ RestartSec=2
 # The helper exits within a second of SIGTERM; anything longer is a wedge.
 TimeoutStopSec=10
 
-# /run/maze is SHARED with maze-tools' maze-guardd (guard.sock) and Maze
+# /run/maze is SHARED with maze-tools' maze-switchd (switch.sock) and Maze
 # Sentinel, so it is NOT a RuntimeDirectory= (systemd would delete it, and
 # their sockets, whenever this unit stops). It is created here outside the
 # sandbox ('+') and the helper sets its group and mode itself.
