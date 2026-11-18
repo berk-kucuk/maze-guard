@@ -23,6 +23,7 @@ from maze.gui.widgets.common import (
     StatTile, attach_empty_state, card, chip, set_chip, setup_table,
 )
 from maze.utils.network_info import get_interface_info, get_open_ports
+from maze.core.tasks import spawn
 
 _RECENT = 7
 _GREY = "#8b919a"
@@ -268,7 +269,7 @@ class DashboardView(QWidget):
         # runs `ip`/`ss`. showEvent refreshes when the page comes back.
         if not self.isVisible() or self._busy:
             return
-        asyncio.ensure_future(self._refresh_async())
+        spawn(self._refresh_async())
 
     def _iface(self) -> str:
         identity = getattr(self._engine, "identity", None)
@@ -483,7 +484,7 @@ class DashboardView(QWidget):
         menu = QMenu(self)
         act = menu.addAction(s.t("dash_block_port").format(port=f"{port}/{proto.upper()}"))
         if menu.exec(self._ports.viewport().mapToGlobal(pos)) == act:
-            asyncio.ensure_future(self._engine.block_port(port, proto))
+            spawn(self._engine.block_port(port, proto))
 
     # ── called by the main window ─────────────────────────────────────────
 

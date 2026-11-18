@@ -10,6 +10,7 @@ from maze.core.profile import Profile, ProfileManager, PROFILES
 from maze.core.verify import FAIL, INFO, NA, PASS, Verdict, WARN
 from maze.utils.ipaddr import AddressSet
 from maze.utils.logger import log
+from maze.core.tasks import spawn
 
 # Event types that mean "this source is actively attacking us right now", as
 # opposed to "something about this source is odd". Only these trigger active
@@ -158,10 +159,10 @@ class MazeEngine:
         if self.helper is not None:
             if self.helper.is_connected():
                 await self._check_helper_version()
-            asyncio.create_task(self._helper_loop())
-        asyncio.create_task(self._ssl_monitor_loop())
-        asyncio.create_task(self._sync_firewall_state())
-        asyncio.create_task(self._block_evidence_loop())
+            spawn(self._helper_loop())
+        spawn(self._ssl_monitor_loop())
+        spawn(self._sync_firewall_state())
+        spawn(self._block_evidence_loop())
         await self.bus.emit(Event(
             type=EventType.ENGINE_READY,
             level=ThreatLevel.SAFE,
@@ -390,7 +391,7 @@ class MazeEngine:
                                "Profile activated", profile.value)
 
     def _on_profile_change(self, profile: Profile) -> None:
-        asyncio.create_task(self.apply_profile(profile))
+        spawn(self.apply_profile(profile))
 
     # ------------------------------------------------------------------
     # Individual module control
@@ -595,7 +596,7 @@ class MazeEngine:
                     ssl_strip.note_tls_endpoint(conn.remote_ip)
             for conn in conns:
                 if conn.remote_port == 80 and ssl_strip.knows_tls(conn.remote_ip):
-                    asyncio.create_task(
+                    spawn(
                         ssl_strip.check_downgrade(conn.remote_ip))
 
     # ── Recon ──────────────────────────────────────────────────────────────
@@ -727,7 +728,7 @@ class MazeEngine:
         self._recon_at[ip] = now
         auto_block = bool(getattr(self.cfg, "auto_block", True))
         frame_macs = list(event.data.get("macs") or [])
-        asyncio.create_task(self._do_recon(ip, auto_block=auto_block,
+        spawn(self._do_recon(ip, auto_block=auto_block,
                                            trigger=event.type.value,
                                            frame_macs=frame_macs))
 

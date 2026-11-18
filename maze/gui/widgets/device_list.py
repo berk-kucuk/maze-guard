@@ -28,6 +28,7 @@ from maze.core.device_intel import (
     DEFAULT_TTL, DeviceIntelCache, describe_progress, export_markdown,
     format_intel, summarize_intel,
 )
+from maze.core.tasks import spawn
 
 _COLUMNS = ("col_ip", "col_mac", "dev_name", "dev_kind", "dev_known",
             "dev_info", "col_first_seen")
@@ -531,7 +532,7 @@ class DeviceListWidget(QWidget):
             return
         mac = self._devices.get(ip, {}).get("mac", "")
         self._pending.add(ip)
-        asyncio.ensure_future(self._async_gather(ip, mac, profile, force))
+        spawn(self._async_gather(ip, mac, profile, force))
 
     async def _async_gather(self, ip: str, mac: str, profile: str,
                             force: bool) -> None:

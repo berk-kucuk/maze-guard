@@ -13,6 +13,7 @@ from maze.core.events import Event, ThreatLevel
 from maze.core.explain import explain
 from maze.gui.theme import THREAT_COLORS
 from maze.gui.widgets.common import attach_empty_state, setup_table
+from maze.core.tasks import spawn
 
 _IP_RE   = re.compile(r'\b(\d{1,3}(?:\.\d{1,3}){3})\b')
 _PORT_RE = re.compile(r'→\s*\S+:(\d{2,5})\b')
@@ -284,8 +285,8 @@ class EventListWidget(QWidget):
             return
         kind, value = chosen.data()
         if kind == "ip":
-            asyncio.ensure_future(self._engine.block_ip(value))
+            spawn(self._engine.block_ip(value))
         elif kind == "port_tcp":
-            asyncio.ensure_future(self._engine.block_port(value, "tcp"))
+            spawn(self._engine.block_port(value, "tcp"))
         elif kind == "port_udp":
-            asyncio.ensure_future(self._engine.block_port(value, "udp"))
+            spawn(self._engine.block_port(value, "udp"))

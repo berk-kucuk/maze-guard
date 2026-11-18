@@ -12,6 +12,7 @@ from maze.gui.theme import THREAT_COLORS
 from maze.gui.widgets.common import (
     attach_empty_state, card, chip, set_chip, setup_table,
 )
+from maze.core.tasks import spawn
 
 
 class FirewallView(QWidget):
@@ -119,7 +120,7 @@ class FirewallView(QWidget):
         # worth it while hidden (tray, or another page). showEvent catches up.
         if not self.isVisible():
             return
-        asyncio.ensure_future(self._async_refresh())
+        spawn(self._async_refresh())
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -203,7 +204,7 @@ class FirewallView(QWidget):
             self._say(s.t("fwv_too_broad").format(ip=ip))
             return
         self._ip_input.clear()
-        asyncio.ensure_future(self._block_ip(ip))
+        spawn(self._block_ip(ip))
 
     def _add_port(self) -> None:
         s = self._state
@@ -213,7 +214,7 @@ class FirewallView(QWidget):
             return
         proto = self._proto_combo.currentData()
         self._port_input.clear()
-        asyncio.ensure_future(self._block_port(int(port_str), proto))
+        spawn(self._block_port(int(port_str), proto))
 
     async def _done(self, ok: bool, ok_text: str, fail_text: str) -> None:
         if ok:
@@ -263,7 +264,7 @@ class FirewallView(QWidget):
         answer = QMessageBox.question(self, s.t("fwv_clear"), s.t("fwv_clear_confirm"))
         if answer != QMessageBox.StandardButton.Yes:
             return
-        asyncio.ensure_future(self._async_flush())
+        spawn(self._async_flush())
 
     async def _async_flush(self) -> None:
         await self._engine.flush_fw()

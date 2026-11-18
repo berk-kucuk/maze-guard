@@ -12,9 +12,9 @@
 
 pkgname=maze-guard
 pkgver=2.20.5
-pkgrel=1
+pkgrel=2
 pkgdesc="Maze Guard — public WiFi security monitor: MITM detection, firewalld integration — for Maze Linux"
-arch=('x86_64' 'aarch64')
+arch=('any')
 url="https://github.com/berk-kucuk/maze-guard"
 license=('MIT')
 # Renamed from the 'maze' package — replace/conflict so pacman migrates cleanly.

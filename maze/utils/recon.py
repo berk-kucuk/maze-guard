@@ -327,7 +327,7 @@ async def _nothing() -> dict:
 async def _fingerprint_services(ip: str, result: ReconResult,
                                 port_nums: set[int]) -> None:
     """Grab banners, HTTP identity and TLS certificate details in parallel."""
-    banner_ports = sorted(port_nums & {21, 22, 23, 25, 110, 143, 143, 587,
+    banner_ports = sorted(port_nums & {21, 22, 23, 25, 110, 143, 587,
                                        6379, 11211, 6667})
     http_ports = sorted(port_nums & {80, 3000, 4200, 5000, 5173, 5357, 8000,
                                      8008, 8080, 8081, 8088, 8123, 8888,

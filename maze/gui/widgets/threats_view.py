@@ -17,6 +17,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QColor
 
 from maze.gui.widgets.common import attach_empty_state, setup_table
+from maze.core.tasks import spawn
 
 SEVERITY_COLORS = {
     "critical": "#ff1744",
@@ -362,7 +363,7 @@ class ThreatsView(QWidget):
         att = self._engine.incidents.get(self._selected_ip)
         if att is None:
             return
-        asyncio.ensure_future(self._async_block(self._selected_ip, att.blocked))
+        spawn(self._async_block(self._selected_ip, att.blocked))
 
     async def _async_block(self, ip: str, currently_blocked: bool) -> None:
         self._busy = True
@@ -378,7 +379,7 @@ class ThreatsView(QWidget):
 
     def _rescan(self) -> None:
         if self._selected_ip:
-            asyncio.ensure_future(self._async_rescan(self._selected_ip))
+            spawn(self._async_rescan(self._selected_ip))
 
     async def _async_rescan(self, ip: str) -> None:
         self._busy = True

@@ -242,7 +242,8 @@ def _fwc_check(args) -> tuple[str, str]:
     if len(rest) == 1 and rest[0] in _FWC_QUERIES:
         return "", ""
     i = 0
-    if i < len(rest) and rest[i] == "--permanent":
+    permanent = bool(rest) and rest[0] == "--permanent"
+    if permanent:
         i += 1
     if i < len(rest) and rest[i] == "--zone":
         if i + 1 >= len(rest) or rest[i + 1] not in _FWC_SAFE_ZONES:
@@ -257,6 +258,12 @@ def _fwc_check(args) -> tuple[str, str]:
             return f"disallowed firewall-cmd argument: {tail[1][:80]}", ""
         if tail[0] == _FWC_REMOVE_RULE:
             return "", _needs_consent(args)
+        # Blocks only ever go in --permanent (audit MG1). --reload is a query
+        # here, free of consent, and it drops every runtime-only rule; a block
+        # added without --permanent could be taken away by anyone in the maze
+        # group with a reload, past the consent that removing it needs.
+        if not permanent:
+            return "rules are only added with --permanent", ""
         return "", _block_needs_consent(*parsed)
     bad = next((a for a in rest if a not in _FWC_SAFE_FLAGS
                 and a not in _FWC_SAFE_ZONES), rest[-1] if rest else "")
@@ -1328,8 +1335,10 @@ def _setup_socket_perms(sock_path: str) -> None:
     sgid = int(os.environ.get("SUDO_GID", "0"))
     if uid:
         try:
-            os.chown(sock_path, uid, sgid)
+            # Mode first, while root still owns it: chmod on a file someone
+            # else owns would need CAP_FOWNER, which the service does not keep.
             os.chmod(sock_path, 0o600)
+            os.chown(sock_path, uid, sgid)
             return
         except Exception:
             pass

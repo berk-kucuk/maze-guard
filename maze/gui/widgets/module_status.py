@@ -8,6 +8,7 @@ from PyQt6.QtCore import Qt
 from maze.core.verify import FAIL, INFO, NA, PASS, WARN, Verdict
 from maze.gui.theme import THREAT_COLORS
 from maze.gui.widgets.common import ToggleSwitch, chip, set_chip
+from maze.core.tasks import spawn
 
 # Colour and one-word label per verdict. The label answers the question the
 # button asks — "is this in effect?" — rather than restating Active/Inactive,
@@ -206,7 +207,7 @@ class ModuleStatusWidget(QWidget):
     def _test(self, key: str) -> None:
         if key in self._testing:
             return
-        asyncio.ensure_future(self._run_test(key))
+        spawn(self._run_test(key))
 
     async def _run_test(self, key: str) -> Verdict:
         self._testing.add(key)
@@ -270,11 +271,11 @@ class ModuleStatusWidget(QWidget):
             self._paint()
             return
         if key == "fw_backend":
-            asyncio.ensure_future(self._toggle_fw_backend())
+            spawn(self._toggle_fw_backend())
         elif key == "firewall":
-            asyncio.ensure_future(self._toggle_shield())
+            spawn(self._toggle_shield())
         else:
-            asyncio.ensure_future(self._toggle_module(key))
+            spawn(self._toggle_module(key))
 
     async def _toggle_module(self, key: str) -> None:
         # The previous verdict described the state we are about to leave.
@@ -357,7 +358,7 @@ class ModuleStatusWidget(QWidget):
     def refresh(self) -> None:
         """Repaint from cached state, and kick off a live firewall re-read."""
         self._paint()
-        asyncio.ensure_future(self._refresh_firewall())
+        spawn(self._refresh_firewall())
 
     async def _refresh_firewall(self) -> None:
         try:

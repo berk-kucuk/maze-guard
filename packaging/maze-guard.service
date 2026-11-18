@@ -53,11 +53,14 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 # Capabilities: only what the helper uses. NET_RAW — the packet capture;
-# NET_ADMIN — net.* sysctls; CHOWN/FOWNER — handing the socket to the maze
-# group; SYS_PTRACE + DAC_* — attributing other users' and root daemons'
-# connections from /proc/<pid>/fd; KILL — ending its own timed-out children.
-# Gone: reboot, mount/SYS_ADMIN, setuid/setgid, BPF, raw I/O, module loading.
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_KILL
+# NET_ADMIN — net.* sysctls; CHOWN — handing the socket to the maze group
+# (root keeps owning it, so chmod needs no FOWNER); SYS_PTRACE +
+# DAC_READ_SEARCH — reading other users' and root daemons' /proc/<pid>/fd
+# and /exe to attribute connections (reads only: DAC_OVERRIDE, which would
+# also let it WRITE any file, is not kept — audit MG3); KILL — ending its own
+# timed-out children. Gone: reboot, mount/SYS_ADMIN, setuid/setgid, BPF, raw
+# I/O, module loading, FOWNER, DAC_OVERRIDE.
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_CHOWN CAP_DAC_READ_SEARCH CAP_SYS_PTRACE CAP_KILL
 # Bounds on what a misbehaving or abused helper can consume.
 MemoryMax=512M
 TasksMax=64

@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 from typing import Callable
+from maze.core.tasks import spawn
 
 # Fixed socket published by the daemon (see maze/helper.py).
 _SOCK_PATH = "/run/maze/maze.sock"
@@ -39,7 +40,7 @@ class HelperClient:
             self._reader, self._writer = await asyncio.open_unix_connection(
                 self._sock, limit=_LINE_LIMIT)
             self._connected = True
-            asyncio.create_task(self._read_loop())
+            spawn(self._read_loop())
             return True
         except Exception:
             return False
@@ -115,7 +116,7 @@ class HelperClient:
 
                 if "event" in msg:
                     for cb in self._event_cbs:
-                        asyncio.create_task(cb(msg))
+                        spawn(cb(msg))
                 elif "id" in msg:
                     rid = msg["id"]
                     fut = self._pending.pop(rid, None)

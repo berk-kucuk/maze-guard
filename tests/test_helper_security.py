@@ -111,6 +111,31 @@ class ConsentBypassTests(unittest.TestCase):
         self.assertEqual(h.consent_asked, [])
 
 
+class RuntimeOnlyRuleTests(unittest.TestCase):
+    """MG1: --reload needs no consent and drops runtime-only rules, so no
+    block may be runtime-only — a reload must never remove protection."""
+
+    def test_runtime_only_block_is_refused(self):
+        h = Harness(consent=True)
+        self.assertFalse(h.fw("--add-rich-rule", ADDR_RULE)["ok"])
+        self.assertFalse(h.fw("--zone", "public", "--add-rich-rule", ADDR_RULE)["ok"])
+        self.assertEqual(h.ran, [])
+
+    def test_permanent_block_still_goes_in(self):
+        h = Harness(consent=False)
+        self.assertTrue(h.fw("--permanent", "--add-rich-rule", ADDR_RULE)["ok"])
+
+    def test_every_block_maze_guard_adds_is_permanent(self):
+        import re
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / "maze"
+        for f in root.rglob("*.py"):
+            if f.name == "helper.py":
+                continue
+            for call in re.findall(r"\[[^\]]*\"--add-rich-rule\"[^\]]*\]", f.read_text()):
+                self.assertIn('"--permanent"', call, f"{f}: {call}")
+
+
 class NetworkCutOffTests(unittest.TestCase):
     """Blocks that would take the machine off its own network must be asked."""
 

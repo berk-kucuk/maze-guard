@@ -22,6 +22,7 @@ from maze.gui.widgets.module_status import ModuleStatusWidget
 from maze.gui.widgets.dashboard_view import DashboardView
 from maze.gui.widgets.firewall_view import FirewallView
 from maze.utils.config import MazeConfig, save_config
+from maze.core.tasks import spawn
 
 
 # Profiles that mean "this network is not mine" — the user has already told
@@ -469,7 +470,7 @@ class Dashboard(QMainWindow):
         # firewall, and a hidden tab redraws nothing anyone can see.
         monitor = self.engine.process_monitor
         if monitor and self.conn_map.isVisible():
-            asyncio.ensure_future(self._refresh_connections(monitor))
+            spawn(self._refresh_connections(monitor))
 
         watcher = self.engine.arp_watcher
         if watcher and self.device_list.isVisible():
@@ -724,7 +725,7 @@ class Dashboard(QMainWindow):
                 p = custom_profiles[custom_idx]
                 self.cfg.profile = f"custom:{getattr(p, 'name', '')}"
                 save_config(self.cfg)
-                asyncio.ensure_future(self._apply_custom_profile(p))
+                spawn(self._apply_custom_profile(p))
         self._sync_tray()
         self.dash_view.refresh()
 
@@ -737,7 +738,7 @@ class Dashboard(QMainWindow):
     def _quit_with_summary(self) -> None:
         # Route through an async step so the incoming-block shield can be torn
         # down before the process exits.
-        asyncio.ensure_future(self._async_quit())
+        spawn(self._async_quit())
 
     async def _async_quit(self) -> None:
         # The inbound shield used to be torn down here, on the grounds that its
